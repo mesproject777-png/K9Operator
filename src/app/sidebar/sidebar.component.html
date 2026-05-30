@@ -1,0 +1,19 @@
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <div class="brand-mark" aria-label="K9">
+      <span>K9</span>
+    </div>
+    <div class="brand-copy">
+      <p>Factory Solutions</p>
+    </div>
+  </div>
+
+  <ul class="sidebar-links">
+    <li *ngFor="let item of sidebarItems" [hidden]="!canAccess(item.pageKey)">
+      <a [routerLink]="item.route" routerLinkActive="active-link">
+        <span class="material-symbols-outlined">{{ item.icon }}</span>
+        <span class="link-label">{{ item.label }}</span>
+      </a>
+    </li>
+  </ul>
+</aside>

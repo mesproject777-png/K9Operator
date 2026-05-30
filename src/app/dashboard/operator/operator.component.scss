@@ -1,0 +1,98 @@
+.operator-page {
+  display: grid;
+  gap: 18px;
+}
+
+.operator-action-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid #cddbea;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 12px 28px rgba(16, 42, 67, 0.08);
+}
+
+.serial-entry {
+  display: grid;
+  gap: 7px;
+  width: min(360px, 100%);
+}
+
+.serial-entry label {
+  color: #24364a;
+  font-size: 0.82rem;
+  font-weight: 900;
+}
+
+.serial-entry input {
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid #bdd0e4;
+  border-radius: 7px;
+  color: #11263d;
+  font-size: 0.95rem;
+  font-weight: 800;
+}
+
+.serial-entry input:focus {
+  border-color: #0d72df;
+  box-shadow: 0 0 0 3px rgba(13, 114, 223, 0.13);
+  outline: none;
+}
+
+.pass-button {
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 18px;
+  border: 1px solid #0d72df;
+  border-radius: 7px;
+  background: #0d72df;
+  color: #ffffff;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.pass-button.passed {
+  border-color: #16a34a;
+  background: #16a34a;
+}
+
+.pass-button:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.operator-message {
+  margin: 0;
+  padding: 11px 13px;
+  border-radius: 7px;
+  font-weight: 800;
+}
+
+.operator-message.success {
+  border: 1px solid #bbf7d0;
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.operator-message.error {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+@media (max-width: 720px) {
+  .operator-action-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .serial-entry,
+  .pass-button {
+    width: 100%;
+  }
+}

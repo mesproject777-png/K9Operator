@@ -1,0 +1,84 @@
+<div class="generatesn-page">
+  <div class="card hero-card">
+    <h2>Generate Serial Numbers</h2>
+    <p class="hero-subtitle">Enter a workflow WO, then generate the remaining SNs from its Serial Pattern.</p>
+    
+    <form (ngSubmit)="generate()" #f="ngForm">
+      <div class="form-grid">
+        <div class="field">
+          <label>Work Order (from Workflow)</label>
+          <input type="text" [(ngModel)]="wo" name="wo" placeholder="Enter WO e.g. WO001" required 
+                 (ngModelChange)="onWoInput($event)" (blur)="validateWo()" [class.loading]="validating" />
+          <small *ngIf="validating">Checking work order availability...</small>
+          <div class="wo-suggestions" *ngIf="!woDetails && woSuggestions.length">
+            <button type="button" *ngFor="let suggestion of woSuggestions" (mousedown)="$event.preventDefault(); selectWoSuggestion(suggestion)">
+              <span class="suggestion-wo">{{suggestion.wo}}</span>
+              <span class="suggestion-meta">
+                {{suggestion.pn || 'No PN'}}
+                <ng-container *ngIf="suggestion.qty"> | Qty {{suggestion.qty}}</ng-container>
+                <ng-container *ngIf="suggestion.sn_type_name"> | {{suggestion.sn_type_name}}</ng-container>
+              </span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="wo-details" *ngIf="woDetails">
+        <h4>WO Details</h4>
+        <div class="detail-grid">
+          <div class="detail-item">
+            <span>PN</span>
+            <strong>{{woDetails.pn}}</strong>
+          </div>
+          <div class="detail-item">
+            <span>WO Quantity</span>
+            <strong>{{woDetails.qty}}</strong>
+          </div>
+          <div class="detail-item">
+            <span>Generated</span>
+            <strong>{{woDetails.generated_qty}}</strong>
+          </div>
+          <div class="detail-item">
+            <span>Available</span>
+            <strong>{{woDetails.balance}}</strong>
+          </div>
+          <div class="detail-item" *ngIf="woDetails.sn_type_name">
+            <span>Serial Pattern</span>
+            <strong>{{woDetails.sn_type_name}}</strong>
+          </div>
+          <div class="detail-item" *ngIf="woDetails.site_name">
+            <span>Site</span>
+            <strong>{{woDetails.site_name}}</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button type="submit" [disabled]="!isValid || loading || validating">
+          {{loading ? 'Generating...' : 'Generate SNs'}}
+        </button>
+        <button type="button" class="secondary" (click)="clearForm()">
+          Clear
+        </button>
+      </div>
+    </form>
+
+    <div *ngIf="message" class="message" [ngClass]="{'success': success, 'error': !success}">
+      {{message}}
+    </div>
+
+    <div *ngIf="sns.length" class="card generated-card">
+      <h3>{{ woDetails?.balance ? 'Generated SNs' : 'Existing Generated SNs' }} ({{sns.length}})</h3>
+      <button class="secondary full-width track-main-btn" (click)="openTracker()">Open SN Tracker (First RSN/SN)</button>
+      <div class="sn-list">
+        <div *ngFor="let sn of sns; let i = index" class="sn-item">
+          <div class="sn-row-head">{{i+1}}. SN: {{sn}}</div>
+          <div class="sn-row-rsn" *ngIf="getRsnAt(i)">RSN: {{ getRsnAt(i) }}</div>
+          <button class="secondary track-inline-btn" (click)="openTracker(getTrackSearchValue(i, sn))">Track</button>
+        </div>
+      </div>
+      <button class="secondary full-width" (click)="copyAllSns()">Copy All to Clipboard</button>
+    </div>
+  </div>
+</div>
+

@@ -1,0 +1,26 @@
+<section class="operator-page">
+  <div class="operator-action-bar" *ngIf="!showResultPanel">
+    <div class="serial-entry">
+      <label for="operatorSerial">Serial Number</label>
+      <input
+        id="operatorSerial"
+        type="text"
+        [(ngModel)]="serialNumber"
+        name="operatorSerial"
+        placeholder="Enter serial number"
+        autocomplete="off"
+        (keydown.enter)="passSerial()"
+      />
+    </div>
+
+    <button type="button" class="pass-button" [class.passed]="isPassed" [disabled]="isPassing" (click)="passSerial()">
+      <span class="material-symbols-outlined" aria-hidden="true">{{ isPassed ? 'check_circle' : 'task_alt' }}</span>
+      {{ isPassing ? 'Entering...' : (isPassed ? 'Passed' : 'Enter') }}
+    </button>
+  </div>
+
+  <p *ngIf="!showResultPanel && successMessage" class="operator-message success">{{ successMessage }}</p>
+  <p *ngIf="!showResultPanel && errorMessage" class="operator-message error">{{ errorMessage }}</p>
+
+  <app-sn-result *ngIf="showResultPanel"></app-sn-result>
+</section>

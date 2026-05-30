@@ -1,0 +1,43 @@
+<div id="outer-container">
+  <div id="sidebar">
+    <app-sidebar></app-sidebar>
+  </div>
+  <div id="content">
+    <header class="app-header">
+      <div class="brand-block">
+        <span class="brand-name">K9</span>
+        <span class="header-context" *ngIf="currentUser">
+          <span><b>Part Number:</b> {{ currentUser.pn || '-' }}</span>
+          <span><b>Work Order:</b> {{ currentUser.wo || '-' }}</span>
+        </span>
+      </div>
+
+      <form class="header-search" aria-label="Search" (submit)="searchSerialNumber($event)">
+        <button type="submit" class="header-search-button" aria-label="Search serial number" (click)="searchSerialNumber($event)">
+          <span class="material-symbols-outlined">search</span>
+        </button>
+        <input
+          type="search"
+          [(ngModel)]="headerSearch"
+          name="headerSearch"
+          (keydown.enter)="searchSerialNumber($event)"
+          (search)="onHeaderSearchInput()"
+          placeholder="Enter SN number..."
+          autocomplete="off"
+        />
+      </form>
+
+      <div class="operator-session">
+        <span class="station-name">{{ currentUser?.station_name || currentUser?.station_code || 'Station' }}</span>
+        <button type="button" class="logout-button" (click)="logout()">
+          <span class="material-symbols-outlined">logout</span>
+          <span>Logout</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="page-content">
+      <router-outlet></router-outlet>
+    </main>
+  </div>
+</div>
