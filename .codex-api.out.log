@@ -1,3 +1,7 @@
+
+> k9-operator@0.0.0 start:api
+> dotnet run --project backend/K9Api
+
 Using launch settings from backend\K9Api\Properties\launchSettings.json...
 Building...
 info: Microsoft.Hosting.Lifetime[14]

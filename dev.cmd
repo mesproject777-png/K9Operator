@@ -10,7 +10,7 @@ echo Starting Angular frontend...
 start "K9 UI" cmd /k "npm start"
 
 echo.
-echo Backend:  http://localhost:5000
-echo Frontend: http://localhost:4200
+echo Backend:  http://localhost:5001
+echo Frontend: http://localhost:4300
 echo.
 echo Close the opened windows to stop the servers.

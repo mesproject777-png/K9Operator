@@ -1,39 +1,133 @@
 .operator-page {
-  display: grid;
-  gap: 18px;
+  min-height: calc(100vh - 92px);
+  padding: 24px 24px 116px;
 }
 
-.operator-action-bar {
+.operator-message-stage {
+  min-height: calc(100vh - 232px);
+  display: grid;
+  place-items: center;
+}
+
+.status-card {
+  width: min(860px, 100%);
+  min-height: 260px;
+  display: grid;
+  place-items: center;
+  gap: 22px;
+  padding: 42px;
+  border: 1px solid #dbe7f3;
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at top left, rgba(13, 114, 223, 0.08), transparent 34%),
+    #ffffff;
+  box-shadow: 0 24px 60px rgba(16, 42, 67, 0.12);
+  text-align: center;
+}
+
+.status-card.success {
+  border-color: #bbf7d0;
+  background:
+    radial-gradient(circle at top left, rgba(22, 163, 74, 0.14), transparent 38%),
+    #f7fff9;
+}
+
+.status-card.error {
+  border-color: #fecaca;
+  background:
+    radial-gradient(circle at top left, rgba(220, 38, 38, 0.13), transparent 38%),
+    #fff8f8;
+}
+
+.status-icon {
+  width: 112px;
+  height: 112px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #94a3b8;
+  color: #ffffff;
+  box-shadow: 0 18px 34px rgba(15, 23, 42, 0.18);
+}
+
+.status-card.success .status-icon {
+  background: #16a34a;
+}
+
+.status-card.error .status-icon {
+  background: #dc2626;
+}
+
+.status-icon .material-symbols-outlined {
+  font-size: 58px;
+  font-variation-settings: 'FILL' 1, 'wght' 700, 'GRAD' 0, 'opsz' 48;
+}
+
+.status-message {
+  max-width: 760px;
+  margin: 0;
+  color: #102a43;
+  font-size: clamp(2rem, 4vw, 4.3rem);
+  font-weight: 950;
+  line-height: 1.12;
+  letter-spacing: -0.04em;
+}
+
+.status-card.success .status-message {
+  color: #166534;
+}
+
+.status-card.error .status-message {
+  color: #b91c1c;
+}
+
+.empty-message {
+  margin: 0;
+  color: #52677d;
+  font-size: clamp(1.5rem, 2.4vw, 2.5rem);
+  font-weight: 850;
+}
+
+.operator-footer {
+  position: fixed;
+  right: 24px;
+  bottom: 18px;
+  left: 24px;
+  z-index: 20;
   display: flex;
   align-items: flex-end;
+  justify-content: center;
   gap: 14px;
   padding: 16px;
   border: 1px solid #cddbea;
-  border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 12px 28px rgba(16, 42, 67, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 18px 44px rgba(16, 42, 67, 0.18);
+  backdrop-filter: blur(12px);
 }
 
 .serial-entry {
   display: grid;
   gap: 7px;
-  width: min(360px, 100%);
+  width: min(520px, 100%);
 }
 
 .serial-entry label {
   color: #24364a;
   font-size: 0.82rem;
   font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .serial-entry input {
-  height: 42px;
-  padding: 0 12px;
+  height: 48px;
+  padding: 0 14px;
   border: 1px solid #bdd0e4;
-  border-radius: 7px;
+  border-radius: 12px;
   color: #11263d;
-  font-size: 0.95rem;
-  font-weight: 800;
+  font-size: 1.05rem;
+  font-weight: 850;
 }
 
 .serial-entry input:focus {
@@ -43,16 +137,18 @@
 }
 
 .pass-button {
-  height: 42px;
+  height: 48px;
+  min-width: 128px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 18px;
+  justify-content: center;
+  padding: 0 22px;
   border: 1px solid #0d72df;
-  border-radius: 7px;
+  border-radius: 12px;
   background: #0d72df;
   color: #ffffff;
-  font-weight: 900;
+  font-size: 1rem;
+  font-weight: 950;
   cursor: pointer;
 }
 
@@ -66,27 +162,33 @@
   cursor: not-allowed;
 }
 
-.operator-message {
-  margin: 0;
-  padding: 11px 13px;
-  border-radius: 7px;
-  font-weight: 800;
-}
-
-.operator-message.success {
-  border: 1px solid #bbf7d0;
-  background: #f0fdf4;
-  color: #166534;
-}
-
-.operator-message.error {
-  border: 1px solid #fecaca;
-  background: #fef2f2;
-  color: #b91c1c;
-}
-
 @media (max-width: 720px) {
-  .operator-action-bar {
+  .operator-page {
+    padding: 16px 12px 178px;
+  }
+
+  .operator-message-stage {
+    min-height: calc(100vh - 268px);
+  }
+
+  .status-card {
+    min-height: 220px;
+    padding: 28px 18px;
+  }
+
+  .status-icon {
+    width: 86px;
+    height: 86px;
+  }
+
+  .status-icon .material-symbols-outlined {
+    font-size: 46px;
+  }
+
+  .operator-footer {
+    right: 12px;
+    bottom: 12px;
+    left: 12px;
     align-items: stretch;
     flex-direction: column;
   }

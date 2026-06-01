@@ -872,14 +872,12 @@ async Task<bool> HandleUsersAsync(HttpContext context)
 app.Use(async (HttpContext context, RequestDelegate next) =>
 {
     var requestOrigin = context.Request.Headers.Origin.ToString();
-    var allowedOrigins = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "http://localhost:4200",
-        "http://127.0.0.1:4200",
-        "http://localhost:4300",
-        "http://127.0.0.1:4300"
-    };
-    context.Response.Headers["Access-Control-Allow-Origin"] = allowedOrigins.Contains(requestOrigin) ? requestOrigin : "http://localhost:4300";
+    var isLocalDevOrigin =
+        Uri.TryCreate(requestOrigin, UriKind.Absolute, out var originUri) &&
+        (string.Equals(originUri.Host, "localhost", StringComparison.OrdinalIgnoreCase) ||
+         string.Equals(originUri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase));
+
+    context.Response.Headers["Access-Control-Allow-Origin"] = isLocalDevOrigin ? requestOrigin : "http://localhost:4300";
     context.Response.Headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
     context.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
 

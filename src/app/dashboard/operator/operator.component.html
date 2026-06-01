@@ -1,5 +1,22 @@
 <section class="operator-page">
-  <div class="operator-action-bar" *ngIf="!showResultPanel">
+  <main class="operator-message-stage">
+    <app-sn-result *ngIf="showResultPanel"></app-sn-result>
+
+    <div *ngIf="!showResultPanel" class="status-card" [class.success]="successMessage" [class.error]="errorMessage">
+      <ng-container *ngIf="successMessage || errorMessage; else emptyOperatorState">
+        <div class="status-icon" aria-hidden="true">
+          <span class="material-symbols-outlined">{{ successMessage ? 'thumb_up' : 'thumb_down' }}</span>
+        </div>
+        <p class="status-message">{{ successMessage || errorMessage }}</p>
+      </ng-container>
+
+      <ng-template #emptyOperatorState>
+        <p class="empty-message">Enter a serial number below to pass this station.</p>
+      </ng-template>
+    </div>
+  </main>
+
+  <footer class="operator-footer" *ngIf="!showResultPanel">
     <div class="serial-entry">
       <label for="operatorSerial">Serial Number</label>
       <input
@@ -14,13 +31,7 @@
     </div>
 
     <button type="button" class="pass-button" [class.passed]="isPassed" [disabled]="isPassing" (click)="passSerial()">
-      <span class="material-symbols-outlined" aria-hidden="true">{{ isPassed ? 'check_circle' : 'task_alt' }}</span>
-      {{ isPassing ? 'Entering...' : (isPassed ? 'Passed' : 'Enter') }}
+      {{ isPassing ? 'Entering...' : 'Enter' }}
     </button>
-  </div>
-
-  <p *ngIf="!showResultPanel && successMessage" class="operator-message success">{{ successMessage }}</p>
-  <p *ngIf="!showResultPanel && errorMessage" class="operator-message error">{{ errorMessage }}</p>
-
-  <app-sn-result *ngIf="showResultPanel"></app-sn-result>
+  </footer>
 </section>

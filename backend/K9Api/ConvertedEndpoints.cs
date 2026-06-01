@@ -373,15 +373,38 @@ public static class ConvertedEndpoints
                 var serialStatus = serial["serial_status"]?.ToString();
                 if (selectedOrder < currentOrder || (selectedOrder == currentOrder && string.Equals(serialStatus, "Completed", StringComparison.OrdinalIgnoreCase)))
                 {
-                    await transaction.RollbackAsync();
+                    await InsertWorkflowStationLogAsync(
+                        connection,
+                        serial,
+                        selected,
+                        "NOT_PASS",
+                        "Station is already passed",
+                        loginId,
+                        serial["current_station_code"],
+                        serial["current_station_order"],
+                        serial["current_station_code"],
+                        serial["current_station_order"]);
+                    await transaction.CommitAsync();
                     return JsonMessage("Station is already passed", 409);
                 }
 
-                if (selectedOrder != currentOrder)
+                var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
+                if (blockingStep is not null)
                 {
-                    var current = routeRows.FirstOrDefault(step => Convert.ToInt32(step["station_order"]) == currentOrder) ?? routeRows[0];
-                    await transaction.RollbackAsync();
-                    return JsonMessage($"Current station is {current["station_code"]}. Please pass current station first.", 409);
+                    var stationName = GetStationDisplayName(blockingStep);
+                    await InsertWorkflowStationLogAsync(
+                        connection,
+                        serial,
+                        selected,
+                        "NOT_PASS",
+                        $"Previous station \"{stationName}\" is not passed",
+                        loginId,
+                        serial["current_station_code"],
+                        serial["current_station_order"],
+                        serial["current_station_code"],
+                        serial["current_station_order"]);
+                    await transaction.CommitAsync();
+                    return JsonMessage($"Previous station \"{stationName}\" is not passed", 409);
                 }
 
                 var nextStep = routeRows.FirstOrDefault(step => Convert.ToInt32(step["station_order"]) > selectedOrder);
@@ -405,6 +428,18 @@ public static class ConvertedEndpoints
                     ("stationCode", nextStationCode),
                     ("stationOrder", nextStationOrder),
                     ("id", serial["id"]));
+
+                await InsertWorkflowStationLogAsync(
+                    connection,
+                    serial,
+                    selected,
+                    "PASS",
+                    "Operator station pass",
+                    loginId,
+                    serial["current_station_code"],
+                    serial["current_station_order"],
+                    nextStationCode,
+                    nextStationOrder);
 
                 await transaction.CommitAsync();
                 return Results.Json(new { message = "Station passed successfully", station_code = selected["station_code"], status = "Passed" });
@@ -3494,6 +3529,71 @@ public static class ConvertedEndpoints
         return matched is not null ? Convert.ToInt32(matched["station_order"]) : Convert.ToInt32(routeRows[0]["station_order"]);
     }
 
+    private static Dictionary<string, object?>? FindBlockingRequiredStep(List<Dictionary<string, object?>> routeRows, int currentOrder, int selectedOrder)
+    {
+        if (selectedOrder <= currentOrder)
+        {
+            return null;
+        }
+
+        return routeRows.FirstOrDefault(step =>
+        {
+            var order = Convert.ToInt32(step["station_order"]);
+            return order >= currentOrder
+                && order < selectedOrder
+                && !IsOptionalSampleStep(step);
+        });
+    }
+
+    private static bool IsOptionalSampleStep(Dictionary<string, object?> step)
+    {
+        return string.Equals(step["sample_mode"]?.ToString(), "Sample", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetStationDisplayName(Dictionary<string, object?> step)
+    {
+        return step["station_name"]?.ToString()
+            ?? step["station_code"]?.ToString()
+            ?? "previous station";
+    }
+
+    private static async Task InsertWorkflowStationLogAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> serial,
+        Dictionary<string, object?> station,
+        string result,
+        string remark,
+        string changedBy,
+        object? beforeStationCode,
+        object? beforeStationOrder,
+        object? afterStationCode,
+        object? afterStationOrder)
+    {
+        await ExecuteAsync(
+            connection,
+            """
+            INSERT INTO workflow_serial_station_logs
+              (workflow_serial_id, workflow_part_id, workflow_work_order_id, station_code, station_name,
+               action_result, remark, changed_by, before_station_code, before_station_order,
+               after_station_code, after_station_order)
+            VALUES
+              (@serialId, @partId, @workOrderId, @stationCode, @stationName,
+               @result, @remark, @changedBy, @beforeCode, @beforeOrder, @afterCode, @afterOrder)
+            """,
+            ("serialId", serial["id"]),
+            ("partId", serial["workflow_part_id"]),
+            ("workOrderId", serial["workflow_work_order_id"]),
+            ("stationCode", station["station_code"]),
+            ("stationName", station["station_name"]),
+            ("result", result),
+            ("remark", remark),
+            ("changedBy", changedBy),
+            ("beforeCode", beforeStationCode),
+            ("beforeOrder", beforeStationOrder),
+            ("afterCode", afterStationCode),
+            ("afterOrder", afterStationOrder));
+    }
+
     private static async Task<object> BuildTracePayloadAsync(NpgsqlConnection connection, string query, Dictionary<string, object?> serial)
     {
         var routeRows = await GetRouteRowsForItemAsync(connection, Convert.ToInt32(serial["item_id"]));
@@ -3506,10 +3606,12 @@ public static class ConvertedEndpoints
                    COALESCE(additional_info, remark, '') AS additional_info
             FROM serial_station_logs
             WHERE serial_id = @serialId
+              AND UPPER(action_result) IN ('PASS', 'FAIL')
             ORDER BY created_at DESC, id DESC
             LIMIT 300
             """,
             ("serialId", serial["id"]));
+        history.Add(BuildSerialGeneratedHistoryRow(serial));
 
         var routing = routeRows.Select(step =>
         {
@@ -3580,6 +3682,20 @@ public static class ConvertedEndpoints
     {
         var routeRows = await GetWorkflowRouteRowsForPartAsync(connection, Convert.ToInt32(serial["workflow_part_id"]));
         var currentOrder = routeRows.Count == 0 ? 0 : ResolveCurrentOrder(serial, routeRows);
+        var history = await QueryRowsAsync(
+            connection,
+            """
+            SELECT id, changed_by AS user_name, created_at AS date_time, station_code AS station,
+                   NULL::text AS length, NULL::text AS pc_name, action_result AS result,
+                   COALESCE(remark, '') AS additional_info
+            FROM workflow_serial_station_logs
+            WHERE workflow_serial_id = @serialId
+              AND UPPER(action_result) IN ('PASS', 'FAIL')
+            ORDER BY created_at DESC, id DESC
+            LIMIT 300
+            """,
+            ("serialId", serial["id"]));
+        history.Add(BuildSerialGeneratedHistoryRow(serial));
 
         var routing = routeRows.Select(step =>
         {
@@ -3641,8 +3757,24 @@ public static class ConvertedEndpoints
             },
             progress = new { total = routing.Count, completed, current = current is null ? 0 : 1, pending, percent },
             routing,
-            history = Array.Empty<object>(),
+            history,
             generated_at = DateTime.UtcNow
+        };
+    }
+
+    private static Dictionary<string, object?> BuildSerialGeneratedHistoryRow(Dictionary<string, object?> serial)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["id"] = 0,
+            ["user_name"] = "system",
+            ["date_time"] = serial["created_at"],
+            ["station"] = serial["current_station_code"],
+            ["length"] = null,
+            ["pc_name"] = null,
+            ["result"] = "",
+            ["additional_info"] = "SN generated",
+            ["event_type"] = "SN_GENERATED"
         };
     }
 
@@ -5079,12 +5211,35 @@ public static class ConvertedEndpoints
             )
             """);
 
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_serial_station_logs (
+              id BIGSERIAL PRIMARY KEY,
+              workflow_serial_id BIGINT NOT NULL REFERENCES workflow_serial_numbers(id) ON DELETE CASCADE,
+              workflow_part_id INTEGER NOT NULL REFERENCES workflow_part_numbers(id) ON DELETE CASCADE,
+              workflow_work_order_id INTEGER NOT NULL REFERENCES workflow_work_orders(id) ON DELETE CASCADE,
+              station_code VARCHAR(80) NOT NULL,
+              station_name VARCHAR(220),
+              action_result VARCHAR(10) NOT NULL,
+              remark TEXT,
+              changed_by VARCHAR(100) NOT NULL DEFAULT 'system',
+              before_station_code VARCHAR(80),
+              before_station_order INTEGER,
+              after_station_code VARCHAR(80),
+              after_station_order INTEGER,
+              created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """);
+
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_work_orders_part ON public.workflow_work_orders (workflow_part_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_route_part ON public.workflow_routing_steps (workflow_part_id, station_order)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_bom_part ON public.workflow_bom_children (workflow_part_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_rules_part ON public.workflow_station_rules (workflow_part_id, station_code)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_serials_wo ON public.workflow_serial_numbers (workflow_work_order_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_serials_part ON public.workflow_serial_numbers (workflow_part_id)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_serial ON public.workflow_serial_station_logs (workflow_serial_id, created_at DESC)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_station ON public.workflow_serial_station_logs (workflow_part_id, station_code)");
     }
 
     private static async Task EnsureRoutingStepLoginColumnsAsync(NpgsqlConnection connection)
