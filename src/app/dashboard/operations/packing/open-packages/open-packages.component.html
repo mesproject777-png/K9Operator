@@ -60,7 +60,7 @@
           <input
             name="scanQuery"
             [(ngModel)]="scanQuery"
-            placeholder="Scan SN / RSN"
+            placeholder="Scan SN"
             autocomplete="off"
             [disabled]="isLoading"
           />
@@ -74,7 +74,6 @@
             <thead>
               <tr>
                 <th>SN</th>
-                <th>RSN</th>
                 <th>PN</th>
                 <th>Rev</th>
                 <th>Status</th>
@@ -84,7 +83,6 @@
             <tbody>
               <tr *ngFor="let i of selectedPackageDetails.items">
                 <td>{{ i.sn }}</td>
-                <td>{{ i.rsn }}</td>
                 <td>{{ i.pn }}</td>
                 <td>{{ i.revision }}</td>
                 <td>{{ i.serial_status }}</td>

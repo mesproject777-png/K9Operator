@@ -7,20 +7,20 @@ This project was generated using [Angular CLI](https://github.com/angular/angula
 To start a local development server, run:
 
 ```bash
-ng serve
+npm run dev
 ```
 
-Once the server is running, open your browser and navigate to `http://localhost:4200/`. The application will automatically reload whenever you modify any of the source files.
+Once the servers are running, open your browser and navigate to `http://localhost:4300/`. The application will automatically reload whenever you modify any of the source files.
 
 ## Local PostgreSQL setup
 
 1. Copy `.env.local.example` to `.env.local`.
 2. Update `PGPASSWORD` in `.env.local` with your local PostgreSQL `postgres` user password.
 3. Ensure the `MESDB` PostgreSQL database exists with the application tables.
-4. Run `npm.cmd run start:api` to start the .NET 8 backend API on `http://localhost:5000`.
-5. Run `npm.cmd start` to start the Angular app on `http://localhost:4200`.
+4. Run `npm.cmd run start:api` to start the .NET 8 backend API on `http://localhost:5001`.
+5. Run `npm.cmd start` to start the Angular app on `http://localhost:4300`.
 
-Tip: You can also run `dev.cmd` from the `K9/` folder to start both the Angular frontend and .NET backend.
+Tip: You can also run `dev.cmd` from the `K9Operator/` folder to start both the Angular frontend and .NET backend.
 
 ## Troubleshooting
 

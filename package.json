@@ -3,8 +3,11 @@
   "version": "0.0.0",
   "scripts": {
     "ng": "ng",
-    "start": "ng serve --port 4300",
-    "start:api": "dotnet run --project backend/K9Api",
+    "stop:ui": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-k9-operator-ui.ps1",
+    "start": "npm run stop:ui && ng serve --host localhost --port 4300",
+    "stop:api": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-k9-operator-api.ps1",
+    "start:api": "npm run stop:api && dotnet run --project backend/K9Api --urls http://localhost:5001",
+    "dev": "dev.cmd",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
     "test": "ng test"

@@ -261,33 +261,105 @@ public static class ConvertedEndpoints
 
             await using var connection = await OpenConnectionAsync();
             await EnsureWorkflowSchemaAsync(connection);
+            await EnsureWorkflowStationLoginsTableAsync(connection);
             var rows = await QueryRowsAsync(
                 connection,
                 """
                 SELECT
-                  r.id,
-                  r.station_login_id AS login_id,
-                  r.station_login_password,
-                  r.station_code,
-                  r.station_name,
-                  p.id AS workflow_part_id,
-                  p.box_qty,
-                  i.pn,
-                  w.id AS workflow_work_order_id,
-                  w.wo
-                FROM item_routing_steps r
-                JOIN items i ON i.id = r.item_id
-                LEFT JOIN workflow_part_numbers p ON UPPER(p.pn) = UPPER(i.pn)
-                LEFT JOIN LATERAL (
-                    SELECT ww.id, ww.wo, ww.updated_at
-                    FROM workflow_work_orders ww
-                    WHERE ww.workflow_part_id = p.id
-                    ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
-                    LIMIT 1
-                ) w ON TRUE
-                WHERE UPPER(r.station_login_id) = UPPER(@loginId)
-                  AND r.station_login_password = @password
-                ORDER BY w.updated_at DESC NULLS LAST, r.updated_at DESC, r.id DESC
+                  station.id,
+                  station.login_id,
+                  station.station_login_password,
+                  station.station_code,
+                  station.station_name,
+                  station.workflow_part_id,
+                  station.box_qty,
+                  station.pn,
+                  station.workflow_work_order_id,
+                  station.wo
+                FROM (
+                    SELECT
+                      l.id,
+                      l.station_login_id AS login_id,
+                      l.station_login_password,
+                      r.station_code,
+                      r.station_name,
+                      r.workflow_part_id,
+                      p.box_qty,
+                      p.pn,
+                      COALESCE(w.id, latest_w.id) AS workflow_work_order_id,
+                      COALESCE(w.wo, latest_w.wo) AS wo,
+                      COALESCE(w.updated_at, latest_w.updated_at) AS workflow_work_order_updated_at,
+                      l.updated_at,
+                      0 AS source_priority
+                    FROM workflow_station_logins l
+                    JOIN workflow_routing_steps r ON r.id = l.workflow_routing_step_id
+                    JOIN workflow_part_numbers p ON p.id = r.workflow_part_id
+                    LEFT JOIN workflow_work_orders w ON w.id = l.workflow_work_order_id
+                    LEFT JOIN LATERAL (
+                        SELECT ww.id, ww.wo, ww.updated_at
+                        FROM workflow_work_orders ww
+                        WHERE ww.workflow_part_id = p.id
+                        ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                        LIMIT 1
+                    ) latest_w ON TRUE
+                    WHERE UPPER(l.station_login_id) = UPPER(@loginId)
+                      AND l.station_login_password = @password
+
+                    UNION ALL
+
+                    SELECT
+                      r.id,
+                      r.station_login_id AS login_id,
+                      r.station_login_password,
+                      r.station_code,
+                      r.station_name,
+                      p.id AS workflow_part_id,
+                      p.box_qty,
+                      i.pn,
+                      w.id AS workflow_work_order_id,
+                      w.wo,
+                      w.updated_at AS workflow_work_order_updated_at,
+                      r.updated_at,
+                      1 AS source_priority
+                    FROM item_routing_steps r
+                    JOIN items i ON i.id = r.item_id
+                    LEFT JOIN workflow_part_numbers p ON UPPER(p.pn) = UPPER(i.pn)
+                    LEFT JOIN LATERAL (
+                        SELECT ww.id, ww.wo, ww.updated_at
+                        FROM workflow_work_orders ww
+                        WHERE ww.workflow_part_id = p.id
+                        ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                        LIMIT 1
+                    ) w ON TRUE
+                    WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+                      AND r.station_login_password = @password
+
+                    UNION ALL
+
+                    SELECT
+                      r.id,
+                      r.station_login_id AS login_id,
+                      r.station_login_password,
+                      r.station_code,
+                      r.station_name,
+                      r.workflow_part_id,
+                      p.box_qty,
+                      p.pn,
+                      w.id AS workflow_work_order_id,
+                      w.wo,
+                      w.updated_at AS workflow_work_order_updated_at,
+                      r.updated_at,
+                      2 AS source_priority
+                    FROM workflow_routing_steps r
+                    JOIN workflow_part_numbers p ON p.id = r.workflow_part_id
+                    LEFT JOIN workflow_work_orders w ON w.workflow_part_id = p.id
+                    WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+                      AND r.station_login_password = @password
+                ) station
+                ORDER BY station.source_priority ASC,
+                         station.workflow_work_order_updated_at DESC NULLS LAST,
+                         station.updated_at DESC,
+                         station.id DESC
                 LIMIT 1
                 """,
                 ("loginId", loginId),
@@ -389,10 +461,10 @@ public static class ConvertedEndpoints
                     return JsonMessage("Parent and child serial cannot be same", 400);
                 }
 
-                if (string.Equals(childSerial["serial_status"]?.ToString(), "Failed", StringComparison.OrdinalIgnoreCase))
+                if (!string.Equals(childSerial["serial_status"]?.ToString(), "Completed", StringComparison.OrdinalIgnoreCase))
                 {
                     await transaction.RollbackAsync();
-                    return JsonMessage("Failed child serial cannot be bound", 409);
+                    return JsonMessage($"Child \"{childSerial["sn"]}\" not passed all stations", 409);
                 }
 
                 var requiredRows = await GetWorkflowBomLinesForStationAsync(
@@ -704,25 +776,13 @@ public static class ConvertedEndpoints
             await using var transaction = await connection.BeginTransactionAsync();
             try
             {
-                var operatorRows = await QueryRowsAsync(
-                    connection,
-                    """
-                    SELECT r.station_code, r.station_name, r.station_order, r.workflow_part_id, r.station_login_id
-                    FROM workflow_routing_steps r
-                    WHERE UPPER(r.station_login_id) = UPPER(@loginId)
-                      AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
-                    ORDER BY r.updated_at DESC, r.id DESC
-                    LIMIT 1
-                    """,
-                    ("loginId", loginId),
-                    ("workflowPartId", requestedWorkflowPartId));
-                if (operatorRows.Count == 0)
+                var operatorStation = await GetOperatorStationByLoginAsync(connection, loginId, requestedWorkflowPartId);
+                if (operatorStation is null)
                 {
                     await transaction.RollbackAsync();
-                    return JsonMessage("Invalid station login ID", 401);
+                    return JsonMessage("Station login session is no longer assigned. Please login again", 401);
                 }
 
-                var operatorStation = operatorRows[0];
                 var serial = await GetWorkflowSerialByQueryAsync(connection, query);
                 if (serial is null)
                 {
@@ -4046,7 +4106,7 @@ public static class ConvertedEndpoints
         var operatorStation = await GetOperatorStationByLoginAsync(connection, loginId, requestedWorkflowPartId);
         if (operatorStation is null)
         {
-            return (null, JsonMessage("Invalid station login ID", 401));
+            return (null, JsonMessage("Station login session is no longer assigned. Please login again", 401));
         }
 
         var serial = await GetWorkflowSerialByQueryAsync(connection, query);
@@ -4092,14 +4152,64 @@ public static class ConvertedEndpoints
         string loginId,
         int? workflowPartId = null)
     {
+        await EnsureWorkflowStationLoginsTableAsync(connection);
         var rows = await QueryRowsAsync(
             connection,
             """
-            SELECT r.station_code, r.station_name, r.station_order, r.workflow_part_id, r.station_login_id
-            FROM workflow_routing_steps r
-            WHERE UPPER(r.station_login_id) = UPPER(@loginId)
-              AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
-            ORDER BY r.updated_at DESC, r.id DESC
+            SELECT
+              station.station_code,
+              station.station_name,
+              station.station_order,
+              station.workflow_part_id,
+              station.station_login_id
+            FROM (
+                SELECT
+                  r.station_code,
+                  r.station_name,
+                  r.station_order,
+                  r.workflow_part_id,
+                  l.station_login_id,
+                  l.updated_at,
+                  l.id,
+                  0 AS source_priority
+                FROM workflow_station_logins l
+                JOIN workflow_routing_steps r ON r.id = l.workflow_routing_step_id
+                WHERE UPPER(l.station_login_id) = UPPER(@loginId)
+                  AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
+
+                UNION ALL
+
+                SELECT
+                  r.station_code,
+                  r.station_name,
+                  r.station_order,
+                  p.id AS workflow_part_id,
+                  r.station_login_id,
+                  r.updated_at,
+                  r.id,
+                  1 AS source_priority
+                FROM item_routing_steps r
+                JOIN items i ON i.id = r.item_id
+                LEFT JOIN workflow_part_numbers p ON UPPER(p.pn) = UPPER(i.pn)
+                WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+                  AND (@workflowPartId IS NULL OR p.id = @workflowPartId)
+
+                UNION ALL
+
+                SELECT
+                  r.station_code,
+                  r.station_name,
+                  r.station_order,
+                  r.workflow_part_id,
+                  r.station_login_id,
+                  r.updated_at,
+                  r.id,
+                  2 AS source_priority
+                FROM workflow_routing_steps r
+                WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+                  AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
+            ) station
+            ORDER BY station.source_priority ASC, station.updated_at DESC, station.id DESC
             LIMIT 1
             """,
             ("loginId", loginId),
@@ -6217,6 +6327,29 @@ public static class ConvertedEndpoints
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_serial ON public.workflow_serial_station_logs (workflow_serial_id, created_at DESC)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_station ON public.workflow_serial_station_logs (workflow_part_id, station_code)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_multiboxes_open ON public.workflow_multiboxes (workflow_part_id, workflow_work_order_id, status)");
+    }
+
+    private static async Task EnsureWorkflowStationLoginsTableAsync(NpgsqlConnection connection)
+    {
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_station_logins (
+              id SERIAL PRIMARY KEY,
+              workflow_work_order_id INTEGER REFERENCES workflow_work_orders(id) ON DELETE CASCADE,
+              workflow_routing_step_id INTEGER NOT NULL REFERENCES workflow_routing_steps(id) ON DELETE CASCADE,
+              station_login_id VARCHAR(160) NOT NULL,
+              station_login_password VARCHAR(220) NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_workflow_station_login_id UNIQUE (workflow_routing_step_id, station_login_id)
+            )
+            """);
+
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_logins ADD COLUMN IF NOT EXISTS workflow_work_order_id INTEGER REFERENCES workflow_work_orders(id) ON DELETE CASCADE");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logins_step ON public.workflow_station_logins (workflow_routing_step_id)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logins_wo ON public.workflow_station_logins (workflow_work_order_id)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logins_login ON public.workflow_station_logins (UPPER(station_login_id))");
     }
 
     private static async Task EnsureRoutingStepLoginColumnsAsync(NpgsqlConnection connection)

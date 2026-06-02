@@ -7,13 +7,13 @@
       <div class="brand-block">
         <span class="brand-name">K9</span>
         <span class="header-context" *ngIf="currentUser">
-          <span><b>Part Number:</b> {{ currentUser.pn || '-' }}</span>
-          <span><b>Work Order:</b> {{ currentUser.wo || '-' }}</span>
+          <span title="PN: {{ currentUser.pn || '-' }}"><b>PN:</b> {{ currentUser.pn || '-' }}</span>
+          <span title="WO: {{ currentUser.wo || '-' }}"><b>WO:</b> {{ currentUser.wo || '-' }}</span>
         </span>
       </div>
 
       <form class="header-search" aria-label="Search" (submit)="searchSerialNumber($event)">
-        <button type="submit" class="header-search-button" aria-label="Search serial number" (click)="searchSerialNumber($event)">
+        <button type="submit" class="header-search-button" aria-label="Search serial number">
           <span class="material-symbols-outlined">search</span>
         </button>
         <input
@@ -28,7 +28,8 @@
       </form>
 
       <div class="operator-session">
-        <span class="station-name">{{ currentUser?.station_name || currentUser?.station_code || 'Station' }}</span>
+        <span class="login-id" title="Login ID: {{ currentUser?.login_id || '-' }}">Login ID: {{ currentUser?.login_id || '-' }}</span>
+        <span class="station-name" title="{{ currentUser?.station_name || currentUser?.station_code || 'Station' }}">{{ currentUser?.station_name || currentUser?.station_code || 'Station' }}</span>
         <button type="button" class="logout-button" (click)="logout()">
           <span class="material-symbols-outlined">logout</span>
           <span>Logout</span>

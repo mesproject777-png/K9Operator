@@ -77,7 +77,67 @@
     </ng-container>
 
     <ng-template #standardOperatorView>
-      <div *ngIf="!showResultPanel" class="status-card" [class.success]="successMessage" [class.error]="errorMessage">
+      <div *ngIf="!showResultPanel && bindingContext" class="assembly-card">
+        <div class="assembly-header">
+          <span class="material-symbols-outlined" aria-hidden="true">account_tree</span>
+          <div>
+            <p>Parent Serial</p>
+            <h2>{{ bindingContext.parent.sn }}</h2>
+            <small>{{ bindingContext.parent.pn }} | {{ bindingContext.parent.station_code }} - {{ bindingContext.parent.station_name }}</small>
+          </div>
+        </div>
+
+        <div class="assembly-counters">
+          <div>
+            <span>Required</span>
+            <strong>{{ bindingContext.requiredTotal }}</strong>
+          </div>
+          <div>
+            <span>Bound</span>
+            <strong>{{ bindingContext.boundTotal }}</strong>
+          </div>
+          <div>
+            <span>Remaining</span>
+            <strong>{{ bindingContext.remaining }}</strong>
+          </div>
+        </div>
+
+        <p
+          *ngIf="errorMessage || successMessage"
+          class="assembly-message"
+          [class.error]="errorMessage"
+          [class.success]="!errorMessage && successMessage"
+          aria-live="polite"
+        >
+          {{ errorMessage || successMessage }}
+        </p>
+
+        <div class="assembly-lines">
+          <div
+            class="assembly-line"
+            *ngFor="let line of bindingContext.required"
+            [class.complete]="line.remaining_qty === 0"
+          >
+            <div>
+              <strong>{{ line.son_pn }}</strong>
+              <small>{{ line.son_description || line.son_pn }}</small>
+            </div>
+            <span>{{ line.bound_qty }} / {{ line.qty }}</span>
+          </div>
+        </div>
+
+        <div class="assembly-bound-list" *ngIf="bindingContext.bindings.length > 0">
+          <div class="assembly-bound-item" *ngFor="let binding of bindingContext.bindings">
+            <span class="material-symbols-outlined" aria-hidden="true">check_circle</span>
+            <div>
+              <strong>{{ binding.child_sn }}</strong>
+              <small>{{ binding.child_pn }}</small>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div *ngIf="!showResultPanel && !bindingContext" class="status-card" [class.success]="successMessage" [class.error]="errorMessage">
         <ng-container *ngIf="successMessage || errorMessage; else emptyOperatorState">
           <div class="status-icon" aria-hidden="true">
             <span class="material-symbols-outlined">{{ successMessage ? 'thumb_up' : 'thumb_down' }}</span>
@@ -94,27 +154,41 @@
 
   <footer class="operator-footer" *ngIf="!showResultPanel && !canUseMultibox()">
     <div class="serial-entry">
-      <label for="operatorSerial">{{ canUseMultibox() ? 'Product Serial' : 'Serial Number' }}</label>
+      <label for="operatorSerial">{{ bindingContext ? 'Child Serial Number' : 'Serial Number' }}</label>
       <input
+        *ngIf="!bindingContext"
         id="operatorSerial"
         type="text"
         [(ngModel)]="serialNumber"
         name="operatorSerial"
-        [placeholder]="canUseMultibox() ? 'Scan product serial' : 'Enter serial number'"
+        placeholder="Enter serial number"
         autocomplete="off"
-        [disabled]="canUseMultibox() && (isMultiboxLoading || !!multiboxStatus?.is_closed)"
-        (keydown.enter)="submitSerial()"
+        (keydown.enter)="passSerial()"
+      />
+      <input
+        *ngIf="bindingContext"
+        id="operatorSerial"
+        type="text"
+        [(ngModel)]="childSerialNumber"
+        name="operatorChildSerial"
+        placeholder="Enter child serial number"
+        autocomplete="off"
+        (keydown.enter)="passSerial()"
       />
     </div>
 
     <button
       type="button"
-      class="pass-button"
-      [class.passed]="isPassed"
-      [disabled]="isPassing || (canUseMultibox() && (isMultiboxLoading || !!multiboxStatus?.is_closed))"
-      (click)="submitSerial()"
+      class="reset-button"
+      *ngIf="bindingContext"
+      [disabled]="isOperatorBusy"
+      (click)="resetBindingSession()"
     >
-      {{ canUseMultibox() ? (isMultiboxLoading ? 'Scanning...' : 'Scan') : (isPassing ? 'Entering...' : 'Enter') }}
+      Reset
+    </button>
+
+    <button type="button" class="pass-button" [class.passed]="isPassed" [disabled]="isOperatorBusy" (click)="passSerial()">
+      {{ footerButtonLabel }}
     </button>
 
   </footer>

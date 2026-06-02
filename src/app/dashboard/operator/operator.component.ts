@@ -1,9 +1,48 @@
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpParams } from '@angular/common/http';
 import { Component, OnDestroy } from '@angular/core';
 import { ActivatedRoute, Router } from '@angular/router';
 import { Subscription } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import { AuthService, AuthUser } from '../../services/auth.service';
+
+interface OperatorAssemblyRequiredLine {
+  id: number;
+  son_pn: string;
+  son_description: string;
+  station_code: string;
+  station_name: string;
+  item_type: string;
+  qty: number;
+  bound_qty: number;
+  remaining_qty: number;
+}
+
+interface OperatorAssemblyBinding {
+  id: number;
+  workflow_bom_child_id: number;
+  child_sn: string;
+  child_rsn: string;
+  child_pn: string;
+  child_status: string;
+  created_at: string;
+}
+
+interface OperatorAssemblyStatusResponse {
+  parent: {
+    id: number;
+    sn: string;
+    rsn: string;
+    pn: string;
+    station_code: string;
+    station_name: string;
+  };
+  required: OperatorAssemblyRequiredLine[];
+  bindings: OperatorAssemblyBinding[];
+  requiredTotal: number;
+  boundTotal: number;
+  remaining: number;
+  requiresBinding: boolean;
+}
 
 @Component({
   selector: 'app-operator',
@@ -13,9 +52,12 @@ import { AuthService, AuthUser } from '../../services/auth.service';
 })
 export class OperatorComponent implements OnDestroy {
   serialNumber = '';
+  childSerialNumber = '';
   displayedSerial = '';
   showResultPanel = false;
   isPassing = false;
+  isCheckingAssembly = false;
+  isBindingChild = false;
   isPassed = false;
   isMultiboxOpen = false;
   isMultiboxLoading = false;
@@ -38,9 +80,12 @@ export class OperatorComponent implements OnDestroy {
   } | null = null;
   successMessage = '';
   errorMessage = '';
+  bindingContext: OperatorAssemblyStatusResponse | null = null;
   currentUser: AuthUser | null = null;
 
   private readonly apiUrl = `${environment.apiUrl}/api/operator`;
+  private readonly assemblyStatusApi = `${this.apiUrl}/assembly/status`;
+  private readonly assemblyBindApi = `${this.apiUrl}/assembly/bind`;
   private readonly routeSub: Subscription;
 
   constructor(
@@ -59,11 +104,15 @@ export class OperatorComponent implements OnDestroy {
         this.successMessage = '';
         this.isPassed = false;
         this.showResultPanel = true;
+        this.bindingContext = null;
+        this.childSerialNumber = '';
         return;
       }
 
       this.displayedSerial = '';
       this.showResultPanel = false;
+      this.bindingContext = null;
+      this.childSerialNumber = '';
     });
   }
 
@@ -76,6 +125,16 @@ export class OperatorComponent implements OnDestroy {
     this.successMessage = '';
     this.isPassed = false;
 
+    if (this.bindingContext) {
+      if (this.bindingContext.remaining > 0) {
+        this.bindChildSerial();
+        return;
+      }
+
+      this.completePass(this.bindingContext.parent.sn);
+      return;
+    }
+
     const query = this.serialNumber.trim();
     if (!query) {
       this.errorMessage = 'Please enter serial number.';
@@ -87,21 +146,152 @@ export class OperatorComponent implements OnDestroy {
       return;
     }
 
+    this.checkAssemblyRequirement(query);
+  }
+
+  resetBindingSession(): void {
+    this.bindingContext = null;
+    this.childSerialNumber = '';
+    this.displayedSerial = '';
+    this.successMessage = '';
+    this.errorMessage = '';
+  }
+
+  get isOperatorBusy(): boolean {
+    return this.isPassing || this.isCheckingAssembly || this.isBindingChild;
+  }
+
+  get footerButtonLabel(): string {
+    if (this.isOperatorBusy) {
+      return this.bindingContext ? 'Checking...' : 'Entering...';
+    }
+
+    if (!this.bindingContext) {
+      return 'Enter';
+    }
+
+    return this.bindingContext.remaining > 0 ? 'Bind' : 'Pass Station';
+  }
+
+  get requiredChildSummary(): string {
+    if (!this.bindingContext?.required?.length) {
+      return '-';
+    }
+
+    return this.bindingContext.required
+      .map((line) => `${line.son_pn} ${line.bound_qty}/${line.qty}`)
+      .join(', ');
+  }
+
+  get nextRequiredChildPn(): string {
+    const pending = this.bindingContext?.required?.find((line) => line.remaining_qty > 0);
+    return pending?.son_pn || 'child SN';
+  }
+
+  private checkAssemblyRequirement(query: string): void {
+    if (!this.currentUser?.login_id) {
+      this.errorMessage = 'Station login session is missing. Please login again.';
+      return;
+    }
+
+    this.isCheckingAssembly = true;
+    let params = new HttpParams()
+      .set('parent_query', query)
+      .set('loginId', this.currentUser.login_id);
+    if (this.currentUser.workflow_part_id) {
+      params = params.set('workflowPartId', String(this.currentUser.workflow_part_id));
+    }
+
+    this.http.get<OperatorAssemblyStatusResponse>(this.assemblyStatusApi, { params }).subscribe({
+      next: (status) => {
+        this.isCheckingAssembly = false;
+
+        if (status.requiresBinding && status.remaining > 0) {
+          this.bindingContext = status;
+          this.displayedSerial = status.parent.sn;
+          this.childSerialNumber = '';
+          this.successMessage = `Parent set: ${status.parent.sn}. Required: ${this.requiredChildSummary}`;
+          return;
+        }
+
+        this.completePass(query);
+      },
+      error: (error) => {
+        this.isCheckingAssembly = false;
+        this.errorMessage = error?.error?.message || error?.error?.error || 'Unable to check BOM binding requirement.';
+      },
+    });
+  }
+
+  private bindChildSerial(): void {
+    const childQuery = this.childSerialNumber.trim();
+    if (!childQuery) {
+      this.errorMessage = 'Please enter child serial number.';
+      return;
+    }
+
+    if (!this.bindingContext || !this.currentUser?.login_id) {
+      this.errorMessage = 'Parent serial session is missing. Please scan parent serial again.';
+      return;
+    }
+
+    this.isBindingChild = true;
+    this.http.post<OperatorAssemblyStatusResponse>(this.assemblyBindApi, {
+      parent_query: this.bindingContext.parent.sn,
+      child_query: childQuery,
+      loginId: this.currentUser.login_id,
+      workflowPartId: this.currentUser.workflow_part_id,
+    }).subscribe({
+      next: (status) => {
+        this.isBindingChild = false;
+        this.bindingContext = status;
+        this.childSerialNumber = '';
+        this.successMessage = status.remaining > 0
+          ? `Child bound. Remaining: ${status.remaining}. Required: ${this.requiredChildSummary}`
+          : 'All required child serials bound. Passing station...';
+
+        if (status.remaining === 0) {
+          this.completePass(status.parent.sn);
+        }
+      },
+      error: (error) => {
+        this.isBindingChild = false;
+        this.errorMessage = error?.error?.message || error?.error?.error || 'Unable to bind child serial.';
+      },
+    });
+  }
+
+  private completePass(query: string): void {
+    if (!this.currentUser?.login_id) {
+      this.errorMessage = 'Station login session is missing. Please login again.';
+      return;
+    }
+
     this.isPassing = true;
     this.http.post<{ message?: string }>(`${this.apiUrl}/pass`, {
       query,
       loginId: this.currentUser.login_id,
+      workflowPartId: this.currentUser.workflow_part_id,
     }).subscribe({
       next: (response) => {
         this.isPassing = false;
         this.isPassed = true;
         this.displayedSerial = '';
         this.showResultPanel = false;
+        this.bindingContext = null;
+        this.childSerialNumber = '';
+        this.serialNumber = '';
         this.successMessage = response?.message || 'Station passed successfully.';
         this.router.navigate(['/dashboard/operator']);
       },
       error: (error) => {
         this.isPassing = false;
+        const assembly = error?.error?.assembly as OperatorAssemblyStatusResponse | undefined;
+        if (assembly?.requiresBinding) {
+          this.bindingContext = assembly;
+          this.displayedSerial = assembly.parent.sn;
+        }
+
         this.errorMessage = error?.error?.message || error?.error?.error || 'Unable to pass station.';
       },
     });
