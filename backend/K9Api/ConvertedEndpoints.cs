@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.IO.Compression;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -395,6 +396,204 @@ public static class ConvertedEndpoints
                 box_qty = station["box_qty"],
                 is_pack_station = IsPackStation(station["station_code"]?.ToString(), station["station_name"]?.ToString())
             });
+        });
+
+        app.MapGet("/api/operator/label-printing-config", async (HttpRequest request) =>
+        {
+            var loginId = request.Query["loginId"].ToString().Trim();
+            var stationCodeFilter = request.Query["stationCode"].ToString().Trim();
+            var workflowPartIdFilter = int.TryParse(request.Query["workflowPartId"].ToString(), out var parsedWorkflowPartId)
+                ? parsedWorkflowPartId
+                : (int?)null;
+            if (string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonError("loginId is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter, stationCodeFilter);
+            if (station is null)
+            {
+                return JsonError("Invalid station login ID", 404);
+            }
+
+            var config = await GetWorkflowStationLabelPrintingConfigAsync(
+                connection,
+                Convert.ToInt32(station["workflow_part_id"]),
+                station["station_code"]?.ToString());
+
+            if (config is null || config["isLabelPrintingEnabled"] is not bool enabled || !enabled)
+            {
+                return Results.Json(new { isLabelPrintingEnabled = false });
+            }
+
+            return Results.Json(BuildOperatorLabelPrintingResponse(config, station));
+        });
+
+        app.MapPut("/api/operator/label-printing-config", async (HttpContext context) =>
+        {
+            var payload = await ReadJsonBodyAsync(context.Request);
+            var loginId = ReadString(payload, "loginId")?.Trim();
+            var workflowPartIdFilter = ReadInt(payload, "workflowPartId");
+            var stationCodeFilter = ReadString(payload, "stationCode")?.Trim();
+            var printerIp = FirstNonEmpty(
+                ReadString(payload, "ipAddress")?.Trim() ?? string.Empty,
+                ReadString(payload, "printerIp")?.Trim() ?? string.Empty);
+            var port = ReadString(payload, "port")?.Trim();
+
+            if (string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonError("loginId is required", 400);
+            }
+
+            if (string.IsNullOrWhiteSpace(printerIp))
+            {
+                return JsonError("Printer IP is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter, stationCodeFilter);
+            if (station is null)
+            {
+                return JsonError("Invalid station login ID", 404);
+            }
+
+            var workflowPartId = Convert.ToInt32(station["workflow_part_id"]);
+            var stationCode = station["station_code"]?.ToString();
+            var existingConfig = await GetWorkflowStationLabelPrintingConfigAsync(connection, workflowPartId, stationCode);
+            if (existingConfig is null || existingConfig["isLabelPrintingEnabled"] is not bool enabled || !enabled)
+            {
+                return JsonError("Label printing is not enabled for this station", 404);
+            }
+
+            var printerPort = ParsePositiveInt(port, ParsePositiveInt(existingConfig["port"], 9100)).ToString(CultureInfo.InvariantCulture);
+            await UpdateWorkflowStationPrinterAsync(connection, workflowPartId, stationCode, printerIp, printerPort);
+
+            var config = await GetWorkflowStationLabelPrintingConfigAsync(connection, workflowPartId, stationCode);
+            return Results.Json(BuildOperatorLabelPrintingResponse(config!, station, "Printer saved"));
+        });
+
+        app.MapPost("/api/operator/label-printing-config/test-connection", async (HttpContext context) =>
+        {
+            var payload = await ReadJsonBodyAsync(context.Request);
+            var loginId = ReadString(payload, "loginId")?.Trim();
+            var workflowPartIdFilter = ReadInt(payload, "workflowPartId");
+            var stationCodeFilter = ReadString(payload, "stationCode")?.Trim();
+            var printerIp = FirstNonEmpty(
+                ReadString(payload, "ipAddress")?.Trim() ?? string.Empty,
+                ReadString(payload, "printerIp")?.Trim() ?? string.Empty);
+            var port = ReadString(payload, "port")?.Trim();
+
+            if (string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonError("loginId is required", 400);
+            }
+
+            if (string.IsNullOrWhiteSpace(printerIp))
+            {
+                return JsonError("Printer IP is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter, stationCodeFilter);
+            if (station is null)
+            {
+                return JsonError("Invalid station login ID", 404);
+            }
+
+            var workflowPartId = Convert.ToInt32(station["workflow_part_id"]);
+            var stationCode = station["station_code"]?.ToString();
+            var existingConfig = await GetWorkflowStationLabelPrintingConfigAsync(connection, workflowPartId, stationCode);
+            if (existingConfig is null || existingConfig["isLabelPrintingEnabled"] is not bool enabled || !enabled)
+            {
+                return JsonError("Label printing is not enabled for this station", 404);
+            }
+
+            var printerPort = ParsePositiveInt(port, ParsePositiveInt(existingConfig["port"], 9100));
+            try
+            {
+                await TestPrinterConnectionAsync(printerIp, printerPort);
+                await UpdateWorkflowStationPrinterAsync(connection, workflowPartId, stationCode, printerIp, printerPort.ToString(CultureInfo.InvariantCulture), "Online");
+                var config = await GetWorkflowStationLabelPrintingConfigAsync(connection, workflowPartId, stationCode);
+                return Results.Json(BuildOperatorLabelPrintingResponse(config!, station, "Connected", true));
+            }
+            catch
+            {
+                await UpdateWorkflowStationPrinterAsync(connection, workflowPartId, stationCode, printerIp, printerPort.ToString(CultureInfo.InvariantCulture), "Offline");
+                var config = await GetWorkflowStationLabelPrintingConfigAsync(connection, workflowPartId, stationCode);
+                return Results.Json(BuildOperatorLabelPrintingResponse(config!, station, "Connection failed", false));
+            }
+        });
+
+        app.MapPost("/api/operator/label-printing-config/test-print", async (HttpContext context) =>
+        {
+            var payload = await ReadJsonBodyAsync(context.Request);
+            var loginId = ReadString(payload, "loginId")?.Trim();
+            var workflowPartIdFilter = ReadInt(payload, "workflowPartId");
+            var stationCodeFilter = ReadString(payload, "stationCode")?.Trim();
+            var printerIp = FirstNonEmpty(
+                ReadString(payload, "ipAddress")?.Trim() ?? string.Empty,
+                ReadString(payload, "printerIp")?.Trim() ?? string.Empty);
+            var port = ReadString(payload, "port")?.Trim();
+
+            if (string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonError("loginId is required", 400);
+            }
+
+            if (string.IsNullOrWhiteSpace(printerIp))
+            {
+                return JsonError("Printer IP is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter, stationCodeFilter);
+            if (station is null)
+            {
+                return JsonError("Invalid station login ID", 404);
+            }
+
+            var workflowPartId = Convert.ToInt32(station["workflow_part_id"]);
+            var stationCode = station["station_code"]?.ToString();
+            var existingConfig = await GetWorkflowStationLabelPrintingConfigAsync(connection, workflowPartId, stationCode);
+            if (existingConfig is null || existingConfig["isLabelPrintingEnabled"] is not bool enabled || !enabled)
+            {
+                return JsonError("Label printing is not enabled for this station", 404);
+            }
+
+            var labelCode = ReadDictionaryText(existingConfig, "labelCode");
+            if (string.IsNullOrWhiteSpace(labelCode))
+            {
+                return JsonError("Label Code is missing for this station", 400);
+            }
+
+            var prnContent = await GetLatestLabelPrnTemplateByCodeAsync(connection, labelCode);
+            if (string.IsNullOrWhiteSpace(prnContent))
+            {
+                return JsonError("PRN template is missing for this Label Code", 404);
+            }
+
+            var printerPort = ParsePositiveInt(port, ParsePositiveInt(existingConfig["port"], 9100));
+            await UpdateWorkflowStationPrinterAsync(connection, workflowPartId, stationCode, printerIp, printerPort.ToString(CultureInfo.InvariantCulture));
+
+            try
+            {
+                var renderedPrn = ApplyWorkflowLabelPlaceholders(prnContent, BuildOperatorTestLabelSerial(station), station);
+                await SendRawPrinterDataAsync(printerIp, printerPort, renderedPrn);
+                await UpdateWorkflowStationPrinterAsync(connection, workflowPartId, stationCode, printerIp, printerPort.ToString(CultureInfo.InvariantCulture), "Online");
+                var config = await GetWorkflowStationLabelPrintingConfigAsync(connection, workflowPartId, stationCode);
+                return Results.Json(BuildOperatorLabelPrintingResponse(config!, station, "Test print sent", true));
+            }
+            catch
+            {
+                await UpdateWorkflowStationPrinterAsync(connection, workflowPartId, stationCode, printerIp, printerPort.ToString(CultureInfo.InvariantCulture), "Offline");
+                var config = await GetWorkflowStationLabelPrintingConfigAsync(connection, workflowPartId, stationCode);
+                return Results.Json(BuildOperatorLabelPrintingResponse(config!, station, "Test print failed", false));
+            }
         });
 
         app.MapGet("/api/operator/assembly/status", async (HttpRequest request) =>
@@ -914,8 +1113,20 @@ public static class ConvertedEndpoints
                     nextStationOrder,
                     nextStatus);
 
+                var labelPrinting = await GetWorkflowStationLabelPrintingConfigAsync(
+                    connection,
+                    workflowPartId,
+                    selected["station_code"]?.ToString());
+
                 await transaction.CommitAsync();
-                return Results.Json(new { message = "Station passed successfully", station_code = selected["station_code"], status = "Passed" });
+                await TryPrintWorkflowStationLabelAsync(connection, serial, selected, labelPrinting);
+                return Results.Json(new
+                {
+                    message = "Station passed successfully",
+                    station_code = selected["station_code"],
+                    status = "Passed",
+                    label_printing = labelPrinting
+                });
             }
             catch
             {
@@ -3945,6 +4156,7 @@ public static class ConvertedEndpoints
                    ), 0) AS wo_balance,
                    p.id AS workflow_part_id, p.pn, p.description AS item_description,
                    COALESCE(w.plant, '') AS plant,
+                   COALESCE(w.lot, '') AS lot,
                    COALESCE(w.revision, '-') AS revision,
                    COALESCE(w.site_name, '-') AS site_name,
                    COALESCE(p.item_type, '-') AS product_line_name
@@ -4150,7 +4362,8 @@ public static class ConvertedEndpoints
     private static async Task<Dictionary<string, object?>?> GetOperatorStationByLoginAsync(
         NpgsqlConnection connection,
         string loginId,
-        int? workflowPartId = null)
+        int? workflowPartId = null,
+        string? stationCode = null)
     {
         await EnsureWorkflowStationLoginsTableAsync(connection);
         var rows = await QueryRowsAsync(
@@ -4176,6 +4389,7 @@ public static class ConvertedEndpoints
                 JOIN workflow_routing_steps r ON r.id = l.workflow_routing_step_id
                 WHERE UPPER(l.station_login_id) = UPPER(@loginId)
                   AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
+                  AND (@stationCode = '' OR UPPER(r.station_code) = UPPER(@stationCode))
 
                 UNION ALL
 
@@ -4193,6 +4407,7 @@ public static class ConvertedEndpoints
                 LEFT JOIN workflow_part_numbers p ON UPPER(p.pn) = UPPER(i.pn)
                 WHERE UPPER(r.station_login_id) = UPPER(@loginId)
                   AND (@workflowPartId IS NULL OR p.id = @workflowPartId)
+                  AND (@stationCode = '' OR UPPER(r.station_code) = UPPER(@stationCode))
 
                 UNION ALL
 
@@ -4208,12 +4423,14 @@ public static class ConvertedEndpoints
                 FROM workflow_routing_steps r
                 WHERE UPPER(r.station_login_id) = UPPER(@loginId)
                   AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
+                  AND (@stationCode = '' OR UPPER(r.station_code) = UPPER(@stationCode))
             ) station
             ORDER BY station.source_priority ASC, station.updated_at DESC, station.id DESC
             LIMIT 1
             """,
             ("loginId", loginId),
-            ("workflowPartId", workflowPartId));
+            ("workflowPartId", workflowPartId),
+            ("stationCode", stationCode?.Trim() ?? string.Empty));
         return rows.Count == 0 ? null : rows[0];
     }
 
@@ -5113,6 +5330,51 @@ public static class ConvertedEndpoints
                 }
             }
 
+            if (payload["stationLabelPrinting"] is JsonObject stationLabelPrinting)
+            {
+                await ExecuteAsync(connection, "DELETE FROM workflow_station_label_printing WHERE workflow_part_id = @workflowPartId", ("workflowPartId", workflowPartId));
+                foreach (var configGroup in stationLabelPrinting)
+                {
+                    var stationCode = configGroup.Key.Trim();
+                    if (string.IsNullOrWhiteSpace(stationCode) || configGroup.Value is null) continue;
+
+                    await ExecuteAsync(
+                        connection,
+                        """
+                        INSERT INTO workflow_station_label_printing
+                          (workflow_part_id, station_code, station_id, station_name, label_code, label_description,
+                           printer_id, printer_name, ip_address, port, status, is_label_printing_enabled)
+                        VALUES
+                          (@workflowPartId, @stationCode, @stationId, @stationName, @labelCode, @labelDescription,
+                           @printerId, @printerName, @ipAddress, @port, @status, @isLabelPrintingEnabled)
+                        ON CONFLICT (workflow_part_id, station_code) DO UPDATE
+                        SET station_id = EXCLUDED.station_id,
+                            station_name = EXCLUDED.station_name,
+                            label_code = EXCLUDED.label_code,
+                            label_description = EXCLUDED.label_description,
+                            printer_id = EXCLUDED.printer_id,
+                            printer_name = EXCLUDED.printer_name,
+                            ip_address = EXCLUDED.ip_address,
+                            port = EXCLUDED.port,
+                            status = EXCLUDED.status,
+                            is_label_printing_enabled = EXCLUDED.is_label_printing_enabled,
+                            updated_at = NOW()
+                        """,
+                        ("workflowPartId", workflowPartId),
+                        ("stationCode", stationCode),
+                        ("stationId", ToDbNullable(ReadInt(configGroup.Value, "stationId"))),
+                        ("stationName", ToDbNullable(ReadString(configGroup.Value, "stationName")?.Trim())),
+                        ("labelCode", ReadString(configGroup.Value, "labelCode")?.Trim() ?? string.Empty),
+                        ("labelDescription", ToDbNullable(ReadString(configGroup.Value, "labelDescription")?.Trim())),
+                        ("printerId", ToDbNullable(ReadString(configGroup.Value, "printerId")?.Trim())),
+                        ("printerName", ToDbNullable(ReadString(configGroup.Value, "printerName")?.Trim())),
+                        ("ipAddress", ToDbNullable(ReadString(configGroup.Value, "ipAddress")?.Trim())),
+                        ("port", ToDbNullable(ReadString(configGroup.Value, "port")?.Trim())),
+                        ("status", ToDbNullable(ReadString(configGroup.Value, "status")?.Trim())),
+                        ("isLabelPrintingEnabled", ReadBool(configGroup.Value, "isLabelPrintingEnabled") ?? false));
+                }
+            }
+
             if (payload["previewStatuses"] is JsonObject previewStatuses)
             {
                 await ExecuteAsync(connection, "DELETE FROM workflow_preview_station_statuses WHERE workflow_part_id = @workflowPartId", ("workflowPartId", workflowPartId));
@@ -5714,6 +5976,8 @@ public static class ConvertedEndpoints
                 """,
                 ("workflowPartId", workflowPartId));
 
+            var labelPrintingRows = await GetWorkflowStationLabelPrintingRowsAsync(connection, workflowPartId);
+
             var statusRows = await QueryRowsAsync(
                 connection,
                 """
@@ -5738,6 +6002,7 @@ public static class ConvertedEndpoints
                 routing = routingRows,
                 bom = bomRows,
                 stationRules = GroupWorkflowRules(ruleRows),
+                stationLabelPrinting = GroupWorkflowStationLabelPrinting(labelPrintingRows),
                 previewStatuses = statusRows.ToDictionary(
                     row => Convert.ToString(row["station_code"]) ?? string.Empty,
                     row => Convert.ToString(row["status"]) ?? string.Empty)
@@ -5844,6 +6109,7 @@ public static class ConvertedEndpoints
             routing = existingRoutingRows,
             bom = existingBomRows,
             stationRules = new Dictionary<string, List<string>>(),
+            stationLabelPrinting = new Dictionary<string, object>(),
             previewStatuses = new Dictionary<string, string>()
         };
     }
@@ -5870,6 +6136,339 @@ public static class ConvertedEndpoints
         }
 
         return grouped;
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowStationLabelPrintingRowsAsync(NpgsqlConnection connection, int workflowPartId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              lp.station_code,
+              COALESCE(lp.station_id, r.id) AS station_id,
+              COALESCE(NULLIF(lp.station_name, ''), r.station_name, '') AS station_name,
+              COALESCE(lp.label_code, '') AS label_code,
+              COALESCE(lp.label_description, '') AS label_description,
+              COALESCE(lp.printer_id, '') AS printer_id,
+              COALESCE(lp.printer_name, '') AS printer_name,
+              COALESCE(lp.ip_address, '') AS ip_address,
+              COALESCE(lp.port, '') AS port,
+              COALESCE(lp.status, '') AS status,
+              COALESCE(lp.is_label_printing_enabled, FALSE) AS is_label_printing_enabled
+            FROM workflow_station_label_printing lp
+            LEFT JOIN workflow_routing_steps r
+              ON r.workflow_part_id = lp.workflow_part_id
+             AND r.station_code = lp.station_code
+            WHERE lp.workflow_part_id = @workflowPartId
+            ORDER BY lp.station_code ASC
+            """,
+            ("workflowPartId", workflowPartId));
+    }
+
+    private static Dictionary<string, object> GroupWorkflowStationLabelPrinting(List<Dictionary<string, object?>> rows)
+    {
+        return rows.ToDictionary(
+            row => Convert.ToString(row["station_code"]) ?? string.Empty,
+            row => (object)BuildWorkflowStationLabelPrintingConfig(row),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, object?> BuildWorkflowStationLabelPrintingConfig(Dictionary<string, object?> row)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["stationId"] = row["station_id"] is null || row["station_id"] is DBNull ? null : Convert.ToInt32(row["station_id"]),
+            ["stationName"] = Convert.ToString(row["station_name"]) ?? string.Empty,
+            ["labelCode"] = Convert.ToString(row["label_code"]) ?? string.Empty,
+            ["labelDescription"] = Convert.ToString(row["label_description"]) ?? string.Empty,
+            ["printerId"] = Convert.ToString(row["printer_id"]) ?? string.Empty,
+            ["printerName"] = Convert.ToString(row["printer_name"]) ?? string.Empty,
+            ["ipAddress"] = Convert.ToString(row["ip_address"]) ?? string.Empty,
+            ["port"] = Convert.ToString(row["port"]) ?? string.Empty,
+            ["status"] = Convert.ToString(row["status"]) ?? string.Empty,
+            ["isLabelPrintingEnabled"] = row["is_label_printing_enabled"] is bool enabled && enabled
+        };
+    }
+
+    private static async Task<Dictionary<string, object?>?> GetWorkflowStationLabelPrintingConfigAsync(
+        NpgsqlConnection connection,
+        int workflowPartId,
+        string? stationCode)
+    {
+        if (string.IsNullOrWhiteSpace(stationCode))
+        {
+            return null;
+        }
+
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              lp.station_code,
+              COALESCE(lp.station_id, r.id) AS station_id,
+              COALESCE(NULLIF(lp.station_name, ''), r.station_name, '') AS station_name,
+              COALESCE(lp.label_code, '') AS label_code,
+              COALESCE(lp.label_description, '') AS label_description,
+              COALESCE(lp.printer_id, '') AS printer_id,
+              COALESCE(lp.printer_name, '') AS printer_name,
+              COALESCE(lp.ip_address, '') AS ip_address,
+              COALESCE(lp.port, '') AS port,
+              COALESCE(lp.status, '') AS status,
+              COALESCE(lp.is_label_printing_enabled, FALSE) AS is_label_printing_enabled
+            FROM workflow_station_label_printing lp
+            LEFT JOIN workflow_routing_steps r
+              ON r.workflow_part_id = lp.workflow_part_id
+             AND r.station_code = lp.station_code
+            WHERE lp.workflow_part_id = @workflowPartId
+              AND UPPER(lp.station_code) = UPPER(@stationCode)
+            LIMIT 1
+            """,
+            ("workflowPartId", workflowPartId),
+            ("stationCode", stationCode.Trim()));
+
+        return rows.Count == 0 ? null : BuildWorkflowStationLabelPrintingConfig(rows[0]);
+    }
+
+    private static Dictionary<string, object?> BuildOperatorLabelPrintingResponse(
+        Dictionary<string, object?> config,
+        Dictionary<string, object?> station,
+        string message = "",
+        bool? success = null)
+    {
+        var response = new Dictionary<string, object?>(config, StringComparer.OrdinalIgnoreCase)
+        {
+            ["stationCode"] = Convert.ToString(station["station_code"]) ?? string.Empty,
+            ["stationName"] = Convert.ToString(station["station_name"]) ?? string.Empty,
+            ["workflowPartId"] = station["workflow_part_id"],
+            ["message"] = message
+        };
+
+        if (success.HasValue)
+        {
+            response["success"] = success.Value;
+        }
+
+        return response;
+    }
+
+    private static async Task UpdateWorkflowStationPrinterAsync(
+        NpgsqlConnection connection,
+        int workflowPartId,
+        string? stationCode,
+        string printerIp,
+        string port,
+        string? status = null)
+    {
+        if (string.IsNullOrWhiteSpace(stationCode))
+        {
+            return;
+        }
+
+        if (status is null)
+        {
+            await ExecuteAsync(
+                connection,
+                """
+                UPDATE workflow_station_label_printing
+                SET printer_id = @printerIp,
+                    printer_name = @printerIp,
+                    ip_address = @printerIp,
+                    port = @port,
+                    updated_at = NOW()
+                WHERE workflow_part_id = @workflowPartId
+                  AND UPPER(station_code) = UPPER(@stationCode)
+                  AND is_label_printing_enabled = TRUE
+                """,
+                ("workflowPartId", workflowPartId),
+                ("stationCode", stationCode),
+                ("printerIp", printerIp.Trim()),
+                ("port", port.Trim()));
+            return;
+        }
+
+        await ExecuteAsync(
+            connection,
+            """
+            UPDATE workflow_station_label_printing
+            SET printer_id = @printerIp,
+                printer_name = @printerIp,
+                ip_address = @printerIp,
+                port = @port,
+                status = @status,
+                updated_at = NOW()
+            WHERE workflow_part_id = @workflowPartId
+              AND UPPER(station_code) = UPPER(@stationCode)
+              AND is_label_printing_enabled = TRUE
+            """,
+            ("workflowPartId", workflowPartId),
+            ("stationCode", stationCode),
+            ("printerIp", printerIp.Trim()),
+            ("port", port.Trim()),
+            ("status", status));
+    }
+
+    private static async Task TestPrinterConnectionAsync(string printerIp, int printerPort)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var client = new TcpClient();
+        await client.ConnectAsync(printerIp, printerPort).WaitAsync(timeout.Token);
+    }
+
+    private static Dictionary<string, object?> BuildOperatorTestLabelSerial(Dictionary<string, object?> station)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["sn"] = "TEST-SERIAL",
+            ["rsn"] = "TEST-SERIAL",
+            ["wo"] = station.TryGetValue("wo", out var wo) ? wo : string.Empty,
+            ["pn"] = station.TryGetValue("pn", out var pn) ? pn : string.Empty,
+            ["revision"] = station.TryGetValue("revision", out var revision) ? revision : string.Empty,
+            ["plant"] = station.TryGetValue("plant", out var plant) ? plant : string.Empty,
+            ["site_name"] = station.TryGetValue("site_name", out var siteName) ? siteName : string.Empty,
+            ["lot"] = station.TryGetValue("lot", out var lot) ? lot : string.Empty,
+            ["item_description"] = station.TryGetValue("item_description", out var description) ? description : string.Empty,
+            ["product_line_name"] = station.TryGetValue("product_line_name", out var productLine) ? productLine : string.Empty
+        };
+    }
+
+    private static async Task TryPrintWorkflowStationLabelAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> serial,
+        Dictionary<string, object?> station,
+        Dictionary<string, object?>? labelPrinting)
+    {
+        try
+        {
+            if (labelPrinting is null ||
+                !labelPrinting.TryGetValue("isLabelPrintingEnabled", out var enabledValue) ||
+                enabledValue is not bool enabled ||
+                !enabled)
+            {
+                return;
+            }
+
+            var labelCode = ReadDictionaryText(labelPrinting, "labelCode");
+            var printerIp = ReadDictionaryText(labelPrinting, "ipAddress");
+            if (string.IsNullOrWhiteSpace(labelCode) || string.IsNullOrWhiteSpace(printerIp))
+            {
+                return;
+            }
+
+            var portValue = labelPrinting.TryGetValue("port", out var configuredPort) ? configuredPort : null;
+            var printerPort = ParsePositiveInt(portValue, 9100);
+            var prnContent = await GetLatestLabelPrnTemplateByCodeAsync(connection, labelCode);
+            if (string.IsNullOrWhiteSpace(prnContent))
+            {
+                return;
+            }
+
+            var renderedPrn = ApplyWorkflowLabelPlaceholders(prnContent, serial, station);
+            await SendRawPrinterDataAsync(printerIp, printerPort, renderedPrn);
+        }
+        catch
+        {
+            // Printing must not change the operator station pass result.
+        }
+    }
+
+    private static async Task<string?> GetLatestLabelPrnTemplateByCodeAsync(NpgsqlConnection connection, string labelCode)
+    {
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT latest.prn_content
+            FROM label_masters lm
+            JOIN LATERAL (
+              SELECT prn_content
+              FROM label_prn_templates
+              WHERE label_master_id = lm.id
+                AND COALESCE(NULLIF(TRIM(prn_content), ''), '') <> ''
+              ORDER BY version DESC, id DESC
+              LIMIT 1
+            ) latest ON TRUE
+            WHERE UPPER(lm.label_code) = UPPER(@labelCode)
+              AND COALESCE(lm.status, 'Active') = 'Active'
+            LIMIT 1
+            """,
+            ("labelCode", labelCode.Trim()));
+
+        return rows.Count == 0 ? null : Convert.ToString(rows[0]["prn_content"]);
+    }
+
+    private static string ApplyWorkflowLabelPlaceholders(
+        string template,
+        Dictionary<string, object?> serial,
+        Dictionary<string, object?> station)
+    {
+        var rsn = ReadDictionaryText(serial, "rsn");
+        var sn = ReadDictionaryText(serial, "sn");
+        var serialNumber = FirstNonEmpty(rsn, sn);
+        var itemDescription = ReadDictionaryText(serial, "item_description");
+        var productLine = ReadDictionaryText(serial, "product_line_name");
+        var stationCode = ReadDictionaryText(station, "station_code");
+        var stationName = ReadDictionaryText(station, "station_name");
+
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["RSN"] = serialNumber,
+            ["SN"] = serialNumber,
+            ["SERIAL"] = serialNumber,
+            ["SERIALNUMBER"] = serialNumber,
+            ["WO"] = ReadDictionaryText(serial, "wo"),
+            ["WORKORDER"] = ReadDictionaryText(serial, "wo"),
+            ["PN"] = ReadDictionaryText(serial, "pn"),
+            ["PARTNUMBER"] = ReadDictionaryText(serial, "pn"),
+            ["REVISION"] = ReadDictionaryText(serial, "revision"),
+            ["REV"] = ReadDictionaryText(serial, "revision"),
+            ["PRODUCT"] = itemDescription,
+            ["PRODUCTNAME"] = itemDescription,
+            ["MODEL"] = itemDescription,
+            ["MODELNO"] = itemDescription,
+            ["DESCRIPTION"] = itemDescription,
+            ["PRODUCTDESCRIPTION"] = itemDescription,
+            ["PRODUCTLINE"] = productLine,
+            ["LOT"] = ReadDictionaryText(serial, "lot"),
+            ["PLANT"] = ReadDictionaryText(serial, "plant"),
+            ["SITE"] = ReadDictionaryText(serial, "site_name"),
+            ["SITENAME"] = ReadDictionaryText(serial, "site_name"),
+            ["STATION"] = FirstNonEmpty(stationCode, stationName),
+            ["STATIONCODE"] = stationCode,
+            ["STATIONNAME"] = stationName
+        };
+
+        return Regex.Replace(template, @"\{([^{}]+)\}", match =>
+        {
+            var placeholder = NormalizeLabelPlaceholderName(match.Groups[1].Value);
+            return values.TryGetValue(placeholder, out var value) && !string.IsNullOrWhiteSpace(value)
+                ? value
+                : match.Value;
+        });
+    }
+
+    private static async Task SendRawPrinterDataAsync(string printerIp, int printerPort, string rawData)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var client = new TcpClient();
+        await client.ConnectAsync(printerIp, printerPort).WaitAsync(timeout.Token);
+        using var stream = client.GetStream();
+        var bytes = Encoding.UTF8.GetBytes(rawData);
+        await stream.WriteAsync(bytes, timeout.Token);
+        await stream.FlushAsync(timeout.Token);
+    }
+
+    private static string ReadDictionaryText(Dictionary<string, object?> row, string key)
+    {
+        return row.TryGetValue(key, out var value) ? Convert.ToString(value)?.Trim() ?? string.Empty : string.Empty;
+    }
+
+    private static string NormalizeLabelPlaceholderName(string value)
+    {
+        return Regex.Replace(value.Trim(), "[^A-Za-z0-9]", string.Empty).ToUpperInvariant();
+    }
+
+    private static string FirstNonEmpty(params string[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
     }
 
     private sealed record BomPayload(
@@ -6225,6 +6824,32 @@ public static class ConvertedEndpoints
             )
             """);
 
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_station_label_printing (
+              id SERIAL PRIMARY KEY,
+              workflow_part_id INTEGER NOT NULL REFERENCES workflow_part_numbers(id) ON DELETE CASCADE,
+              station_code VARCHAR(80) NOT NULL,
+              station_id INTEGER,
+              station_name VARCHAR(220),
+              label_code VARCHAR(120) NOT NULL,
+              label_description TEXT,
+              printer_id VARCHAR(160),
+              printer_name VARCHAR(220),
+              ip_address VARCHAR(80),
+              port VARCHAR(20),
+              status VARCHAR(30),
+              is_label_printing_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_workflow_station_label_printing UNIQUE (workflow_part_id, station_code)
+            )
+            """);
+
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_label_printing ADD COLUMN IF NOT EXISTS station_id INTEGER");
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_label_printing ADD COLUMN IF NOT EXISTS is_label_printing_enabled BOOLEAN NOT NULL DEFAULT FALSE");
+
         await ExecuteAsync(connection, "CREATE SEQUENCE IF NOT EXISTS public.workflow_rsn_seq START WITH 1");
         await ExecuteAsync(
             connection,
@@ -6320,6 +6945,7 @@ public static class ConvertedEndpoints
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_route_part ON public.workflow_routing_steps (workflow_part_id, station_order)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_bom_part ON public.workflow_bom_children (workflow_part_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_rules_part ON public.workflow_station_rules (workflow_part_id, station_code)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_label_printing_part ON public.workflow_station_label_printing (workflow_part_id, station_code)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_serials_wo ON public.workflow_serial_numbers (workflow_work_order_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_serials_part ON public.workflow_serial_numbers (workflow_part_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_bom_bind_parent_station ON public.workflow_serial_bom_bindings (parent_workflow_serial_id, station_code)");

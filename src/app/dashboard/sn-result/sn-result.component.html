@@ -30,6 +30,22 @@
         <p *ngIf="previewLoading" class="message">Loading preview data...</p>
         <p *ngIf="!previewLoading && previewMessage" class="message">{{ previewMessage }}</p>
 
+        <div *ngIf="!previewLoading && stationLabelConfig" class="label-card">
+          <div class="label-card-row">
+            <div>
+              <strong>Label Code</strong>
+              <div>{{ stationLabelConfig.labelCode }}</div>
+            </div>
+            <div>
+              <strong>Printer</strong>
+              <div>{{ stationLabelConfig.printerName }} {{ stationLabelConfig.ipAddress ? '(' + stationLabelConfig.ipAddress + ')' : '' }}</div>
+            </div>
+            <div>
+              <button type="button" class="save-button" (click)="openLabelPreview()">View Label Preview</button>
+            </div>
+          </div>
+        </div>
+
         <div class="preview-canvas" *ngIf="!previewLoading && workflowSnapshot?.routing?.length">
           <div class="preview-hierarchy">
             <div class="preview-node hierarchy-node plant-node">
@@ -317,6 +333,24 @@
         <strong>No BOM childs found.</strong>
       </div>
     </ng-template>
+  </div>
+</div>
+
+<div *ngIf="isLabelPreviewOpen" class="preview-popup-backdrop">
+  <div class="label-preview-modal" role="dialog" aria-modal="true">
+    <div class="preview-popup-header">
+      <div>
+        <h3>Label Preview</h3>
+        <p *ngIf="stationLabelConfig"><small>{{ stationLabelConfig.labelCode }} - {{ stationLabelConfig.labelDescription }}</small></p>
+      </div>
+      <button type="button" class="icon-close-button" aria-label="Close label preview" (click)="closeLabelPreview()">
+        <span class="material-symbols-outlined" aria-hidden="true">close</span>
+      </button>
+    </div>
+
+    <div class="label-preview-body">
+      <pre class="label-preview-pre">{{ labelPreviewText }}</pre>
+    </div>
   </div>
 </div>
 

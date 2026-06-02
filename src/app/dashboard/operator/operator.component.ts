@@ -44,6 +44,13 @@ interface OperatorAssemblyStatusResponse {
   requiresBinding: boolean;
 }
 
+interface OperatorPassResponse {
+  message?: string;
+  station_code?: string;
+  status?: string;
+  label_printing?: unknown;
+}
+
 @Component({
   selector: 'app-operator',
   standalone: false,
@@ -268,7 +275,7 @@ export class OperatorComponent implements OnDestroy {
     }
 
     this.isPassing = true;
-    this.http.post<{ message?: string }>(`${this.apiUrl}/pass`, {
+    this.http.post<OperatorPassResponse>(`${this.apiUrl}/pass`, {
       query,
       loginId: this.currentUser.login_id,
       workflowPartId: this.currentUser.workflow_part_id,
@@ -282,6 +289,7 @@ export class OperatorComponent implements OnDestroy {
         this.childSerialNumber = '';
         this.serialNumber = '';
         this.successMessage = response?.message || 'Station passed successfully.';
+        this.serialNumber = '';
         this.router.navigate(['/dashboard/operator']);
       },
       error: (error) => {

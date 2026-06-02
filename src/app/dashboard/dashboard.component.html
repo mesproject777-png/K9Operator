@@ -37,6 +37,53 @@
       </div>
     </header>
 
+    <div class="label-printer-row" *ngIf="labelPrinterConfig?.isLabelPrintingEnabled">
+      <div class="label-printer-panel">
+        <label class="label-printer-field" for="operatorPrinterIp">
+          <span>Printer IP</span>
+          <input
+            id="operatorPrinterIp"
+            type="text"
+            [(ngModel)]="labelPrinterIp"
+            name="operatorPrinterIp"
+            placeholder="Printer IP"
+            autocomplete="off"
+            [disabled]="isTestingPrinterConnection || isSendingTestPrint"
+            (blur)="saveLabelPrinterIp()"
+            (keydown.enter)="saveLabelPrinterIp()"
+          />
+        </label>
+        <button
+          type="button"
+          class="label-printer-button"
+          title="Test Connection"
+          aria-label="Test printer connection"
+          [disabled]="isTestingPrinterConnection || isSendingTestPrint"
+          (click)="testLabelPrinterConnection()"
+        >
+          <span class="material-symbols-outlined" aria-hidden="true">lan</span>
+        </button>
+        <button
+          type="button"
+          class="label-printer-button"
+          title="Test Print"
+          aria-label="Send test print"
+          [disabled]="isSendingTestPrint || isTestingPrinterConnection"
+          (click)="sendLabelPrinterTestPrint()"
+        >
+          <span class="material-symbols-outlined" aria-hidden="true">print</span>
+        </button>
+        <span
+          class="label-printer-message"
+          *ngIf="labelPrinterMessage"
+          [class.success]="labelPrinterMessageType === 'success'"
+          [class.error]="labelPrinterMessageType === 'error'"
+        >
+          {{ labelPrinterMessage }}
+        </span>
+      </div>
+    </div>
+
     <main class="page-content">
       <router-outlet></router-outlet>
     </main>

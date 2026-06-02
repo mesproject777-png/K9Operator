@@ -149,6 +149,109 @@
   white-space: nowrap;
 }
 
+.label-printer-row {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  min-height: 44px;
+  margin: -14px 18px 18px 0;
+}
+
+.label-printer-panel {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 8px;
+  background: rgba(5, 64, 138, 0.32);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.label-printer-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  color: #ffffff;
+}
+
+.label-printer-field span {
+  font-size: 0.68rem;
+  font-weight: 900;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.label-printer-field input {
+  width: 132px;
+  height: 32px;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 255, 255, 0.36);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #0f2442;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.label-printer-field input:focus {
+  border-color: #ffffff;
+  outline: 2px solid rgba(255, 255, 255, 0.28);
+  outline-offset: 1px;
+}
+
+.label-printer-button {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.label-printer-button:hover,
+.label-printer-button:focus-visible {
+  background: rgba(255, 255, 255, 0.18);
+  outline: none;
+}
+
+.label-printer-button:disabled,
+.label-printer-field input:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.label-printer-button .material-symbols-outlined {
+  font-size: 20px;
+}
+
+.label-printer-message {
+  max-width: 96px;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.72rem;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.label-printer-message.success {
+  color: #bbf7d0;
+}
+
+.label-printer-message.error {
+  color: #fecaca;
+}
+
 .station-name {
   min-width: 0;
   max-width: 260px;
@@ -224,5 +327,33 @@
   .operator-session {
     order: 1;
     justify-content: flex-end;
+    align-items: center;
+  }
+
+  .label-printer-row {
+    margin: -8px 0 16px;
+  }
+
+  .label-printer-panel {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 640px) {
+  .label-printer-panel {
+    justify-content: flex-start;
+  }
+
+  .label-printer-field {
+    flex: 1 1 auto;
+  }
+
+  .label-printer-field input {
+    width: 100%;
+  }
+
+  .label-printer-message {
+    max-width: 100%;
   }
 }
