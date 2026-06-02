@@ -19,6 +19,8 @@ export interface AuthUser {
   wo?: string;
   workflow_part_id?: number;
   workflow_work_order_id?: number | null;
+  box_qty?: number | null;
+  is_pack_station?: boolean;
 }
 
 @Injectable({

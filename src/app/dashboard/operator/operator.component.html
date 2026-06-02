@@ -2,36 +2,120 @@
   <main class="operator-message-stage">
     <app-sn-result *ngIf="showResultPanel"></app-sn-result>
 
-    <div *ngIf="!showResultPanel" class="status-card" [class.success]="successMessage" [class.error]="errorMessage">
-      <ng-container *ngIf="successMessage || errorMessage; else emptyOperatorState">
-        <div class="status-icon" aria-hidden="true">
-          <span class="material-symbols-outlined">{{ successMessage ? 'thumb_up' : 'thumb_down' }}</span>
-        </div>
-        <p class="status-message">{{ successMessage || errorMessage }}</p>
-      </ng-container>
+    <ng-container *ngIf="!showResultPanel && canUseMultibox(); else standardOperatorView">
+      <button type="button" class="multibox-corner-button" [class.active]="isMultiboxOpen" (click)="toggleMultibox()">
+        <span class="material-symbols-outlined">inventory_2</span>
+        <span>MultiBox</span>
+      </button>
 
-      <ng-template #emptyOperatorState>
-        <p class="empty-message">Enter a serial number below to pass this station.</p>
-      </ng-template>
-    </div>
+      <section class="multibox-workspace">
+        <header class="multibox-header">
+          <div>
+            <span class="eyebrow">Box Serial</span>
+            <h2>{{ multiboxStatus?.box_no || 'Generating...' }}</h2>
+          </div>
+          <div class="multibox-count">
+            <strong>{{ multiboxProgressText }}</strong>
+            <span>{{ multiboxStatus?.remaining_qty || currentUser?.box_qty || 0 }} remaining</span>
+          </div>
+        </header>
+
+        <div class="multibox-scan-row">
+          <div class="serial-entry">
+            <label for="operatorSerial">Product Serial</label>
+            <input
+              id="operatorSerial"
+              type="text"
+              [(ngModel)]="serialNumber"
+              name="operatorSerial"
+              placeholder="Scan product serial"
+              autocomplete="off"
+              [disabled]="isMultiboxLoading || !!multiboxStatus?.is_closed"
+              (keydown.enter)="submitSerial()"
+            />
+          </div>
+
+          <button
+            type="button"
+            class="pass-button"
+            [disabled]="isMultiboxLoading || !!multiboxStatus?.is_closed"
+            (click)="submitSerial()"
+          >
+            {{ isMultiboxLoading ? 'Scanning...' : 'Scan' }}
+          </button>
+        </div>
+
+        <p class="inline-message success-text" *ngIf="successMessage">{{ successMessage }}</p>
+        <p class="inline-message error-text" *ngIf="errorMessage">{{ errorMessage }}</p>
+      </section>
+
+      <section class="scanned-table-card">
+        <div class="scanned-table-wrap">
+          <table class="scanned-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>SN</th>
+                <th>RSN</th>
+                <th>Scanned At</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr *ngFor="let item of multiboxItems">
+                <td>{{ item.seq }}</td>
+                <td>{{ item.sn || '-' }}</td>
+                <td>{{ item.rsn || '-' }}</td>
+                <td>{{ item.added_at | date:'short' }}</td>
+              </tr>
+              <tr *ngIf="multiboxItems.length === 0">
+                <td colspan="4" class="empty-row">No scanned SNs yet.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </ng-container>
+
+    <ng-template #standardOperatorView>
+      <div *ngIf="!showResultPanel" class="status-card" [class.success]="successMessage" [class.error]="errorMessage">
+        <ng-container *ngIf="successMessage || errorMessage; else emptyOperatorState">
+          <div class="status-icon" aria-hidden="true">
+            <span class="material-symbols-outlined">{{ successMessage ? 'thumb_up' : 'thumb_down' }}</span>
+          </div>
+          <p class="status-message">{{ successMessage || errorMessage }}</p>
+        </ng-container>
+
+        <ng-template #emptyOperatorState>
+          <p class="empty-message">Enter a serial number below to pass this station.</p>
+        </ng-template>
+      </div>
+    </ng-template>
   </main>
 
-  <footer class="operator-footer" *ngIf="!showResultPanel">
+  <footer class="operator-footer" *ngIf="!showResultPanel && !canUseMultibox()">
     <div class="serial-entry">
-      <label for="operatorSerial">Serial Number</label>
+      <label for="operatorSerial">{{ canUseMultibox() ? 'Product Serial' : 'Serial Number' }}</label>
       <input
         id="operatorSerial"
         type="text"
         [(ngModel)]="serialNumber"
         name="operatorSerial"
-        placeholder="Enter serial number"
+        [placeholder]="canUseMultibox() ? 'Scan product serial' : 'Enter serial number'"
         autocomplete="off"
-        (keydown.enter)="passSerial()"
+        [disabled]="canUseMultibox() && (isMultiboxLoading || !!multiboxStatus?.is_closed)"
+        (keydown.enter)="submitSerial()"
       />
     </div>
 
-    <button type="button" class="pass-button" [class.passed]="isPassed" [disabled]="isPassing" (click)="passSerial()">
-      {{ isPassing ? 'Entering...' : 'Enter' }}
+    <button
+      type="button"
+      class="pass-button"
+      [class.passed]="isPassed"
+      [disabled]="isPassing || (canUseMultibox() && (isMultiboxLoading || !!multiboxStatus?.is_closed))"
+      (click)="submitSerial()"
+    >
+      {{ canUseMultibox() ? (isMultiboxLoading ? 'Scanning...' : 'Scan') : (isPassing ? 'Entering...' : 'Enter') }}
     </button>
+
   </footer>
 </section>
