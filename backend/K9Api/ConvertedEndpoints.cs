@@ -270,18 +270,27 @@ public static class ConvertedEndpoints
                   r.station_login_password,
                   r.station_code,
                   r.station_name,
-                  r.workflow_part_id,
-                  p.pn,
+                  p.id AS workflow_part_id,
+                  i.pn,
                   w.id AS workflow_work_order_id,
                   w.wo
-                FROM workflow_routing_steps r
-                JOIN workflow_part_numbers p ON p.id = r.workflow_part_id
-                LEFT JOIN workflow_work_orders w ON w.workflow_part_id = p.id
+                FROM item_routing_steps r
+                JOIN items i ON i.id = r.item_id
+                LEFT JOIN workflow_part_numbers p ON UPPER(p.pn) = UPPER(i.pn)
+                LEFT JOIN LATERAL (
+                    SELECT ww.id, ww.wo, ww.updated_at
+                    FROM workflow_work_orders ww
+                    WHERE ww.workflow_part_id = p.id
+                    ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                    LIMIT 1
+                ) w ON TRUE
                 WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+                  AND r.station_login_password = @password
                 ORDER BY w.updated_at DESC NULLS LAST, r.updated_at DESC, r.id DESC
                 LIMIT 1
                 """,
-                ("loginId", loginId));
+                ("loginId", loginId),
+                ("password", password));
 
             if (rows.Count == 0)
             {
@@ -313,11 +322,157 @@ public static class ConvertedEndpoints
             });
         });
 
+        app.MapGet("/api/operator/assembly/status", async (HttpRequest request) =>
+        {
+            var parentQuery = request.Query["parent_query"].ToString().Trim();
+            var loginId = request.Query["loginId"].ToString().Trim();
+            var workflowPartId = int.TryParse(request.Query["workflowPartId"].ToString(), out var parsedWorkflowPartId)
+                ? parsedWorkflowPartId
+                : (int?)null;
+            if (string.IsNullOrWhiteSpace(parentQuery) || string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonMessage("Parent serial number and login ID are required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var contextResult = await ResolveOperatorWorkflowContextAsync(connection, parentQuery, loginId, workflowPartId);
+            if (contextResult.Error is not null)
+            {
+                return contextResult.Error;
+            }
+
+            var status = await BuildWorkflowBomBindingStatusAsync(connection, contextResult.Context!.Serial, contextResult.Context.Selected);
+            return Results.Json(status.Payload);
+        });
+
+        app.MapPost("/api/operator/assembly/bind", async (HttpContext context) =>
+        {
+            var payload = await ReadJsonBodyAsync(context.Request);
+            var parentQuery = ReadString(payload, "parent_query")?.Trim() ?? ReadString(payload, "parent_sn")?.Trim();
+            var childQuery = ReadString(payload, "child_query")?.Trim() ?? ReadString(payload, "child_sn")?.Trim();
+            var loginId = ReadString(payload, "loginId")?.Trim();
+            var workflowPartId = ReadInt(payload, "workflowPartId");
+            if (string.IsNullOrWhiteSpace(parentQuery) || string.IsNullOrWhiteSpace(childQuery) || string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonMessage("Parent serial number, child serial number, and login ID are required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            await using var transaction = await connection.BeginTransactionAsync();
+            try
+            {
+                var contextResult = await ResolveOperatorWorkflowContextAsync(connection, parentQuery, loginId, workflowPartId);
+                if (contextResult.Error is not null)
+                {
+                    await transaction.RollbackAsync();
+                    return contextResult.Error;
+                }
+
+                var operatorContext = contextResult.Context!;
+                var parentSerial = operatorContext.Serial;
+                var selectedStation = operatorContext.Selected;
+                var childSerial = await GetWorkflowSerialByQueryAsync(connection, childQuery);
+                if (childSerial is null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Child SN/RSN not found", 404);
+                }
+
+                if (Convert.ToInt64(parentSerial["id"]) == Convert.ToInt64(childSerial["id"]))
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Parent and child serial cannot be same", 400);
+                }
+
+                if (string.Equals(childSerial["serial_status"]?.ToString(), "Failed", StringComparison.OrdinalIgnoreCase))
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Failed child serial cannot be bound", 409);
+                }
+
+                var requiredRows = await GetWorkflowBomLinesForStationAsync(
+                    connection,
+                    Convert.ToInt32(parentSerial["workflow_part_id"]),
+                    selectedStation["station_code"]?.ToString() ?? string.Empty);
+                if (requiredRows.Count == 0)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("No BOM child serial is required at this station", 409);
+                }
+
+                var existingChildBinding = await ScalarAsync<long?>(
+                    connection,
+                    "SELECT id FROM workflow_serial_bom_bindings WHERE child_workflow_serial_id = @childId LIMIT 1",
+                    ("childId", childSerial["id"]));
+                if (existingChildBinding is not null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Child serial is already bound", 409);
+                }
+
+                var bindings = await GetWorkflowBomBindingsForParentStationAsync(
+                    connection,
+                    parentSerial["id"]!,
+                    selectedStation["station_code"]?.ToString() ?? string.Empty);
+                var boundByLine = bindings
+                    .GroupBy(row => Convert.ToInt32(row["workflow_bom_child_id"]))
+                    .ToDictionary(group => group.Key, group => group.Count());
+                var childPn = childSerial["pn"]?.ToString() ?? string.Empty;
+                var matchingLine = requiredRows.FirstOrDefault(row =>
+                {
+                    var requiredPn = row["son_pn"]?.ToString() ?? string.Empty;
+                    var lineId = Convert.ToInt32(row["id"]);
+                    var qty = Convert.ToInt32(row["qty"]);
+                    var boundQty = boundByLine.TryGetValue(lineId, out var count) ? count : 0;
+                    return boundQty < qty && string.Equals(requiredPn, childPn, StringComparison.OrdinalIgnoreCase);
+                });
+
+                if (matchingLine is null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage($"Scanned child PN {childPn} is not pending for this station BOM", 409);
+                }
+
+                await ExecuteAsync(
+                    connection,
+                    """
+                    INSERT INTO workflow_serial_bom_bindings
+                      (parent_workflow_serial_id, child_workflow_serial_id, workflow_bom_child_id,
+                       station_code, station_name, created_by)
+                    VALUES
+                      (@parentId, @childId, @bomChildId, @stationCode, @stationName, @createdBy)
+                    """,
+                    ("parentId", parentSerial["id"]),
+                    ("childId", childSerial["id"]),
+                    ("bomChildId", matchingLine["id"]),
+                    ("stationCode", selectedStation["station_code"]),
+                    ("stationName", selectedStation["station_name"]),
+                    ("createdBy", loginId));
+
+                var status = await BuildWorkflowBomBindingStatusAsync(connection, parentSerial, selectedStation);
+                await transaction.CommitAsync();
+                return Results.Json(status.Payload, statusCode: 201);
+            }
+            catch (PostgresException ex) when (ex.SqlState == "23505")
+            {
+                await transaction.RollbackAsync();
+                return JsonMessage("Child serial is already bound", 409);
+            }
+            catch
+            {
+                await transaction.RollbackAsync();
+                throw;
+            }
+        });
+
         app.MapPost("/api/operator/pass", async (HttpContext context) =>
         {
             var payload = await ReadJsonBodyAsync(context.Request);
             var query = ReadString(payload, "query")?.Trim();
             var loginId = ReadString(payload, "loginId")?.Trim();
+            var requestedWorkflowPartId = ReadInt(payload, "workflowPartId");
             if (string.IsNullOrWhiteSpace(query) || string.IsNullOrWhiteSpace(loginId))
             {
                 return JsonMessage("Serial number and login ID are required", 400);
@@ -334,10 +489,12 @@ public static class ConvertedEndpoints
                     SELECT r.station_code, r.station_name, r.station_order, r.workflow_part_id, r.station_login_id
                     FROM workflow_routing_steps r
                     WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+                      AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
                     ORDER BY r.updated_at DESC, r.id DESC
                     LIMIT 1
                     """,
-                    ("loginId", loginId));
+                    ("loginId", loginId),
+                    ("workflowPartId", requestedWorkflowPartId));
                 if (operatorRows.Count == 0)
                 {
                     await transaction.RollbackAsync();
@@ -407,6 +564,28 @@ public static class ConvertedEndpoints
                     return JsonMessage($"Previous station \"{stationName}\" is not passed", 409);
                 }
 
+                var bomStatus = await BuildWorkflowBomBindingStatusAsync(connection, serial, selected);
+                if (bomStatus.RequiresBinding && bomStatus.Remaining > 0)
+                {
+                    await InsertWorkflowStationLogAsync(
+                        connection,
+                        serial,
+                        selected,
+                        "NOT_PASS",
+                        $"Scan required BOM child serials before passing this station. Remaining: {bomStatus.Remaining}",
+                        loginId,
+                        serial["current_station_code"],
+                        serial["current_station_order"],
+                        serial["current_station_code"],
+                        serial["current_station_order"]);
+                    await transaction.CommitAsync();
+                    return Results.Json(new
+                    {
+                        message = $"Scan required BOM child serials before passing this station. Remaining: {bomStatus.Remaining}",
+                        assembly = bomStatus.Payload
+                    }, statusCode: 409);
+                }
+
                 var nextStep = routeRows.FirstOrDefault(step => Convert.ToInt32(step["station_order"]) > selectedOrder);
                 var nextStatus = nextStep is null ? "Completed" : "In Process";
                 var nextStationCode = nextStep?["station_code"] ?? selected["station_code"];
@@ -440,6 +619,19 @@ public static class ConvertedEndpoints
                     serial["current_station_order"],
                     nextStationCode,
                     nextStationOrder);
+
+                await MirrorWorkflowPassToLegacyTraceAsync(
+                    connection,
+                    serial,
+                    selected,
+                    "PASS",
+                    "Operator station pass",
+                    loginId,
+                    serial["current_station_code"],
+                    serial["current_station_order"],
+                    nextStationCode,
+                    nextStationOrder,
+                    nextStatus);
 
                 await transaction.CommitAsync();
                 return Results.Json(new { message = "Station passed successfully", station_code = selected["station_code"], status = "Passed" });
@@ -3517,6 +3709,201 @@ public static class ConvertedEndpoints
             ("workflowPartId", workflowPartId));
     }
 
+    private sealed record OperatorWorkflowContext(
+        Dictionary<string, object?> OperatorStation,
+        Dictionary<string, object?> Serial,
+        Dictionary<string, object?> Selected,
+        List<Dictionary<string, object?>> RouteRows,
+        int CurrentOrder,
+        int SelectedOrder);
+
+    private sealed record WorkflowBomBindingStatus(
+        object Payload,
+        int RequiredTotal,
+        int BoundTotal,
+        int Remaining,
+        bool RequiresBinding);
+
+    private static async Task<(OperatorWorkflowContext? Context, IResult? Error)> ResolveOperatorWorkflowContextAsync(
+        NpgsqlConnection connection,
+        string query,
+        string loginId,
+        int? requestedWorkflowPartId = null)
+    {
+        var operatorStation = await GetOperatorStationByLoginAsync(connection, loginId, requestedWorkflowPartId);
+        if (operatorStation is null)
+        {
+            return (null, JsonMessage("Invalid station login ID", 401));
+        }
+
+        var serial = await GetWorkflowSerialByQueryAsync(connection, query);
+        if (serial is null)
+        {
+            return (null, JsonMessage("SN/RSN not found", 404));
+        }
+
+        var workflowPartId = Convert.ToInt32(serial["workflow_part_id"]);
+        if (Convert.ToInt32(operatorStation["workflow_part_id"]) != workflowPartId)
+        {
+            return (null, JsonMessage("This station login is not assigned to this serial number part number", 409));
+        }
+
+        var routeRows = await GetWorkflowRouteRowsForPartAsync(connection, workflowPartId);
+        var selected = routeRows.FirstOrDefault(step =>
+            string.Equals(step["station_code"]?.ToString(), operatorStation["station_code"]?.ToString(), StringComparison.OrdinalIgnoreCase));
+        if (selected is null)
+        {
+            return (null, JsonMessage("Logged-in station is not in this serial route", 409));
+        }
+
+        var currentOrder = ResolveCurrentOrder(serial, routeRows);
+        var selectedOrder = Convert.ToInt32(selected["station_order"]);
+        var serialStatus = serial["serial_status"]?.ToString();
+        if (selectedOrder < currentOrder || (selectedOrder == currentOrder && string.Equals(serialStatus, "Completed", StringComparison.OrdinalIgnoreCase)))
+        {
+            return (null, JsonMessage("Station is already passed", 409));
+        }
+
+        var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
+        if (blockingStep is not null)
+        {
+            var stationName = GetStationDisplayName(blockingStep);
+            return (null, JsonMessage($"Previous station \"{stationName}\" is not passed", 409));
+        }
+
+        return (new OperatorWorkflowContext(operatorStation, serial, selected, routeRows, currentOrder, selectedOrder), null);
+    }
+
+    private static async Task<Dictionary<string, object?>?> GetOperatorStationByLoginAsync(
+        NpgsqlConnection connection,
+        string loginId,
+        int? workflowPartId = null)
+    {
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT r.station_code, r.station_name, r.station_order, r.workflow_part_id, r.station_login_id
+            FROM workflow_routing_steps r
+            WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+              AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
+            ORDER BY r.updated_at DESC, r.id DESC
+            LIMIT 1
+            """,
+            ("loginId", loginId),
+            ("workflowPartId", workflowPartId));
+        return rows.Count == 0 ? null : rows[0];
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowBomLinesForStationAsync(
+        NpgsqlConnection connection,
+        int workflowPartId,
+        string stationCode)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT id, son_pn, son_description, COALESCE(station_code, '') AS station_code,
+                   COALESCE(station_name, '') AS station_name, COALESCE(item_type, '') AS item_type,
+                   COALESCE(pn_type, '') AS pn_type, qty
+            FROM workflow_bom_children
+            WHERE workflow_part_id = @workflowPartId
+              AND UPPER(COALESCE(station_code, '')) = UPPER(@stationCode)
+            ORDER BY id ASC
+            """,
+            ("workflowPartId", workflowPartId),
+            ("stationCode", stationCode));
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowBomBindingsForParentStationAsync(
+        NpgsqlConnection connection,
+        object parentSerialId,
+        string stationCode)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT l.id, l.workflow_bom_child_id, l.station_code, l.station_name, l.created_by, l.created_at,
+                   child.sn AS child_sn, child.rsn AS child_rsn, child.status AS child_status,
+                   child_part.pn AS child_pn, child_part.description AS child_description
+            FROM workflow_serial_bom_bindings l
+            JOIN workflow_serial_numbers child ON child.id = l.child_workflow_serial_id
+            JOIN workflow_part_numbers child_part ON child_part.id = child.workflow_part_id
+            WHERE l.parent_workflow_serial_id = @parentId
+              AND UPPER(l.station_code) = UPPER(@stationCode)
+            ORDER BY l.created_at ASC, l.id ASC
+            """,
+            ("parentId", parentSerialId),
+            ("stationCode", stationCode));
+    }
+
+    private static async Task<WorkflowBomBindingStatus> BuildWorkflowBomBindingStatusAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> serial,
+        Dictionary<string, object?> station)
+    {
+        var stationCode = station["station_code"]?.ToString() ?? string.Empty;
+        var requiredRows = await GetWorkflowBomLinesForStationAsync(connection, Convert.ToInt32(serial["workflow_part_id"]), stationCode);
+        var bindings = await GetWorkflowBomBindingsForParentStationAsync(connection, serial["id"]!, stationCode);
+        var boundByLine = bindings
+            .GroupBy(row => Convert.ToInt32(row["workflow_bom_child_id"]))
+            .ToDictionary(group => group.Key, group => group.Count());
+
+        var required = requiredRows.Select(line =>
+        {
+            var lineId = Convert.ToInt32(line["id"]);
+            var qty = Convert.ToInt32(line["qty"]);
+            var boundQty = boundByLine.TryGetValue(lineId, out var count) ? count : 0;
+
+            return new
+            {
+                id = lineId,
+                son_pn = line["son_pn"],
+                son_description = line["son_description"],
+                station_code = line["station_code"],
+                station_name = line["station_name"],
+                item_type = line["item_type"],
+                pn_type = line["pn_type"],
+                qty,
+                bound_qty = boundQty,
+                remaining_qty = Math.Max(qty - boundQty, 0)
+            };
+        }).ToList();
+
+        var requiredTotal = required.Sum(row => row.qty);
+        var boundTotal = Math.Min(bindings.Count, requiredTotal);
+        var remaining = Math.Max(requiredTotal - boundTotal, 0);
+        var payload = new
+        {
+            parent = new
+            {
+                id = serial["id"],
+                sn = serial["sn"],
+                rsn = serial["rsn"],
+                pn = serial["pn"],
+                station_code = station["station_code"],
+                station_name = station["station_name"]
+            },
+            required,
+            bindings = bindings.Select(row => new
+            {
+                id = row["id"],
+                workflow_bom_child_id = row["workflow_bom_child_id"],
+                child_sn = row["child_sn"],
+                child_rsn = row["child_rsn"],
+                child_pn = row["child_pn"],
+                child_description = row["child_description"],
+                child_status = row["child_status"],
+                created_at = row["created_at"]
+            }).ToList(),
+            requiredTotal,
+            boundTotal,
+            remaining,
+            requiresBinding = requiredTotal > 0
+        };
+
+        return new WorkflowBomBindingStatus(payload, requiredTotal, boundTotal, remaining, requiredTotal > 0);
+    }
+
     private static int ResolveCurrentOrder(Dictionary<string, object?> serial, List<Dictionary<string, object?>> routeRows)
     {
         if (serial["current_station_order"] is not null)
@@ -3592,6 +3979,162 @@ public static class ConvertedEndpoints
             ("beforeOrder", beforeStationOrder),
             ("afterCode", afterStationCode),
             ("afterOrder", afterStationOrder));
+    }
+
+    private static async Task MirrorWorkflowPassToLegacyTraceAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> workflowSerial,
+        Dictionary<string, object?> station,
+        string result,
+        string remark,
+        string changedBy,
+        object? beforeStationCode,
+        object? beforeStationOrder,
+        object? afterStationCode,
+        object? afterStationOrder,
+        string nextStatus)
+    {
+        await EnsureSerialTrackingSchemaAsync(connection);
+
+        var legacySerial = await GetOrCreateLegacySerialForWorkflowAsync(connection, workflowSerial);
+        if (legacySerial is null)
+        {
+            return;
+        }
+
+        await ExecuteAsync(
+            connection,
+            """
+            UPDATE serial_numbers
+            SET status = @status,
+                condition = 'Good',
+                current_station_code = @stationCode,
+                current_station_order = @stationOrder,
+                last_moved_at = NOW(),
+                updated_at = NOW()
+            WHERE id = @id
+            """,
+            ("status", nextStatus),
+            ("stationCode", afterStationCode),
+            ("stationOrder", afterStationOrder),
+            ("id", legacySerial["id"]));
+
+        await ExecuteAsync(
+            connection,
+            """
+            INSERT INTO serial_station_logs
+              (serial_id, item_id, work_order_id, station_code, station_name, action_result, remark, changed_by,
+               before_station_code, before_station_order, after_station_code, after_station_order,
+               station_length, pc_name, additional_info)
+            VALUES
+              (@serialId, @itemId, @workOrderId, @stationCode, @stationName, @result, @remark, @changedBy,
+               @beforeCode, @beforeOrder, @afterCode, @afterOrder, NULL, 'K9-OPERATOR', @additionalInfo)
+            """,
+            ("serialId", legacySerial["id"]),
+            ("itemId", legacySerial["item_id"]),
+            ("workOrderId", legacySerial["work_order_id"]),
+            ("stationCode", station["station_code"]),
+            ("stationName", station["station_name"]),
+            ("result", result),
+            ("remark", remark),
+            ("changedBy", changedBy),
+            ("beforeCode", beforeStationCode),
+            ("beforeOrder", beforeStationOrder),
+            ("afterCode", afterStationCode),
+            ("afterOrder", afterStationOrder),
+            ("additionalInfo", remark));
+    }
+
+    private static async Task<Dictionary<string, object?>?> GetOrCreateLegacySerialForWorkflowAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> workflowSerial)
+    {
+        var sn = workflowSerial["sn"]?.ToString();
+        var rsn = workflowSerial["rsn"]?.ToString();
+        if (string.IsNullOrWhiteSpace(sn) && string.IsNullOrWhiteSpace(rsn))
+        {
+            return null;
+        }
+
+        var existing = await QueryRowsAsync(
+            connection,
+            """
+            SELECT id, sn, rsn, work_order_id, item_id, item_revision_id, site_id,
+                   status AS serial_status, condition, current_station_code, current_station_order
+            FROM serial_numbers
+            WHERE (@sn = '' OR UPPER(sn) = UPPER(@sn))
+               OR (@rsn = '' OR UPPER(rsn) = UPPER(@rsn))
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            ("sn", sn ?? string.Empty),
+            ("rsn", rsn ?? string.Empty));
+        if (existing.Count > 0)
+        {
+            return existing[0];
+        }
+
+        var legacyWorkOrder = await QueryRowsAsync(
+            connection,
+            """
+            SELECT w.id AS work_order_id, w.item_id, w.item_revision_id, w.site_id
+            FROM work_orders w
+            JOIN items i ON i.id = w.item_id
+            WHERE UPPER(w.wo) = UPPER(@wo)
+              AND UPPER(i.pn) = UPPER(@pn)
+            ORDER BY w.created_at DESC, w.id DESC
+            LIMIT 1
+            """,
+            ("wo", workflowSerial["wo"]?.ToString() ?? string.Empty),
+            ("pn", workflowSerial["pn"]?.ToString() ?? string.Empty));
+        if (legacyWorkOrder.Count == 0 || string.IsNullOrWhiteSpace(sn))
+        {
+            return null;
+        }
+
+        try
+        {
+            var inserted = await QueryRowsAsync(
+                connection,
+                """
+                INSERT INTO serial_numbers
+                  (sn, rsn, work_order_id, item_id, item_revision_id, site_id, status, condition,
+                   current_station_code, current_station_order, last_moved_at, created_at, updated_at)
+                VALUES
+                  (@sn, @rsn, @workOrderId, @itemId, @revisionId, @siteId, @status, @condition,
+                   @stationCode, @stationOrder, @lastMovedAt, @createdAt, NOW())
+                RETURNING id, sn, rsn, work_order_id, item_id, item_revision_id, site_id,
+                          status AS serial_status, condition, current_station_code, current_station_order
+                """,
+                ("sn", sn),
+                ("rsn", string.IsNullOrWhiteSpace(rsn) ? DBNull.Value : rsn),
+                ("workOrderId", legacyWorkOrder[0]["work_order_id"]),
+                ("itemId", legacyWorkOrder[0]["item_id"]),
+                ("revisionId", legacyWorkOrder[0]["item_revision_id"]),
+                ("siteId", legacyWorkOrder[0]["site_id"]),
+                ("status", workflowSerial["serial_status"]),
+                ("condition", workflowSerial["condition"]),
+                ("stationCode", workflowSerial["current_station_code"]),
+                ("stationOrder", workflowSerial["current_station_order"]),
+                ("lastMovedAt", workflowSerial["last_moved_at"]),
+                ("createdAt", workflowSerial["created_at"]));
+            return inserted[0];
+        }
+        catch (PostgresException ex) when (ex.SqlState == "23505")
+        {
+            var retry = await QueryRowsAsync(
+                connection,
+                """
+                SELECT id, sn, rsn, work_order_id, item_id, item_revision_id, site_id,
+                       status AS serial_status, condition, current_station_code, current_station_order
+                FROM serial_numbers
+                WHERE UPPER(sn) = UPPER(@sn)
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                ("sn", sn));
+            return retry.Count == 0 ? null : retry[0];
+        }
     }
 
     private static async Task<object> BuildTracePayloadAsync(NpgsqlConnection connection, string query, Dictionary<string, object?> serial)
@@ -3695,7 +4238,12 @@ public static class ConvertedEndpoints
             LIMIT 300
             """,
             ("serialId", serial["id"]));
+        history.AddRange(await GetWorkflowBomBindingHistoryRowsAsync(connection, serial["id"]!));
         history.Add(BuildSerialGeneratedHistoryRow(serial));
+        history = history
+            .OrderByDescending(row => row["date_time"] is DateTime dateTime ? dateTime : DateTime.MinValue)
+            .ThenByDescending(row => Convert.ToInt64(row["id"] ?? 0))
+            .ToList();
 
         var routing = routeRows.Select(step =>
         {
@@ -3760,6 +4308,49 @@ public static class ConvertedEndpoints
             history,
             generated_at = DateTime.UtcNow
         };
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowBomBindingHistoryRowsAsync(
+        NpgsqlConnection connection,
+        object workflowSerialId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT l.id,
+                   l.created_by AS user_name,
+                   l.created_at AS date_time,
+                   l.station_code AS station,
+                   NULL::text AS length,
+                   NULL::text AS pc_name,
+                   ''::text AS result,
+                   CASE
+                     WHEN l.parent_workflow_serial_id = @serialId
+                       THEN 'Bound child ' || child.rsn || ' (' || child_part.pn || ')'
+                     ELSE 'Bound to parent ' || parent_sn.rsn || ' (' || parent_part.pn || ')'
+                   END AS additional_info,
+                   'BOM_BIND'::text AS event_type,
+                   child.sn AS child_sn,
+                   child.rsn AS child_rsn,
+                   child_part.pn AS child_pn,
+                   COALESCE(child_wo.revision, '-') AS child_revision,
+                   parent_sn.sn AS parent_sn,
+                   parent_sn.rsn AS parent_rsn,
+                   parent_part.pn AS parent_pn,
+                   COALESCE(parent_wo.revision, '-') AS parent_revision
+            FROM workflow_serial_bom_bindings l
+            JOIN workflow_serial_numbers parent_sn ON parent_sn.id = l.parent_workflow_serial_id
+            JOIN workflow_part_numbers parent_part ON parent_part.id = parent_sn.workflow_part_id
+            LEFT JOIN workflow_work_orders parent_wo ON parent_wo.id = parent_sn.workflow_work_order_id
+            JOIN workflow_serial_numbers child ON child.id = l.child_workflow_serial_id
+            JOIN workflow_part_numbers child_part ON child_part.id = child.workflow_part_id
+            LEFT JOIN workflow_work_orders child_wo ON child_wo.id = child.workflow_work_order_id
+            WHERE l.parent_workflow_serial_id = @serialId
+               OR l.child_workflow_serial_id = @serialId
+            ORDER BY l.created_at DESC, l.id DESC
+            LIMIT 300
+            """,
+            ("serialId", workflowSerialId));
     }
 
     private static Dictionary<string, object?> BuildSerialGeneratedHistoryRow(Dictionary<string, object?> serial)
@@ -5232,12 +5823,31 @@ public static class ConvertedEndpoints
             )
             """);
 
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_serial_bom_bindings (
+              id BIGSERIAL PRIMARY KEY,
+              parent_workflow_serial_id BIGINT NOT NULL REFERENCES workflow_serial_numbers(id) ON DELETE CASCADE,
+              child_workflow_serial_id BIGINT NOT NULL REFERENCES workflow_serial_numbers(id) ON DELETE RESTRICT,
+              workflow_bom_child_id INTEGER NOT NULL REFERENCES workflow_bom_children(id) ON DELETE RESTRICT,
+              station_code VARCHAR(80) NOT NULL,
+              station_name VARCHAR(220),
+              created_by VARCHAR(100) NOT NULL DEFAULT 'system',
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_workflow_bom_child_serial UNIQUE (child_workflow_serial_id),
+              CONSTRAINT uq_workflow_bom_parent_child_station UNIQUE (parent_workflow_serial_id, child_workflow_serial_id, station_code)
+            )
+            """);
+
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_work_orders_part ON public.workflow_work_orders (workflow_part_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_route_part ON public.workflow_routing_steps (workflow_part_id, station_order)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_bom_part ON public.workflow_bom_children (workflow_part_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_rules_part ON public.workflow_station_rules (workflow_part_id, station_code)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_serials_wo ON public.workflow_serial_numbers (workflow_work_order_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_serials_part ON public.workflow_serial_numbers (workflow_part_id)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_bom_bind_parent_station ON public.workflow_serial_bom_bindings (parent_workflow_serial_id, station_code)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_bom_bind_child ON public.workflow_serial_bom_bindings (child_workflow_serial_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_serial ON public.workflow_serial_station_logs (workflow_serial_id, created_at DESC)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_station ON public.workflow_serial_station_logs (workflow_part_id, station_code)");
     }
