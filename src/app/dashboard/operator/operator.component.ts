@@ -50,10 +50,6 @@ export class OperatorComponent implements OnDestroy {
     private router: Router
   ) {
     this.currentUser = this.authService.getCurrentUser();
-    if (this.canUseMultibox()) {
-      this.isMultiboxOpen = true;
-      this.loadMultiboxStatus();
-    }
     this.routeSub = this.route.queryParamMap.subscribe((params) => {
       const query = String(params.get('q') || '').trim();
       if (query) {
@@ -116,12 +112,10 @@ export class OperatorComponent implements OnDestroy {
   }
 
   toggleMultibox(): void {
-    this.isMultiboxOpen = !this.isMultiboxOpen;
     this.errorMessage = '';
     this.successMessage = '';
-    if (this.isMultiboxOpen) {
-      this.loadMultiboxStatus();
-    }
+    this.isMultiboxOpen = true;
+    this.loadMultiboxStatus();
   }
 
   loadMultiboxStatus(): void {

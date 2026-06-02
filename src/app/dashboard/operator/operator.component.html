@@ -5,10 +5,10 @@
     <ng-container *ngIf="!showResultPanel && canUseMultibox(); else standardOperatorView">
       <button type="button" class="multibox-corner-button" [class.active]="isMultiboxOpen" (click)="toggleMultibox()">
         <span class="material-symbols-outlined">inventory_2</span>
-        <span>MultiBox</span>
+        <span>New Multibox</span>
       </button>
 
-      <section class="multibox-workspace">
+      <section class="multibox-workspace" *ngIf="isMultiboxOpen">
         <header class="multibox-header">
           <div>
             <span class="eyebrow">Box Serial</span>
@@ -49,7 +49,7 @@
         <p class="inline-message error-text" *ngIf="errorMessage">{{ errorMessage }}</p>
       </section>
 
-      <section class="scanned-table-card">
+      <section class="scanned-table-card" *ngIf="isMultiboxOpen">
         <div class="scanned-table-wrap">
           <table class="scanned-table">
             <thead>
