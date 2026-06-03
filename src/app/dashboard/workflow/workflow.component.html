@@ -454,7 +454,6 @@
                     <th>Description</th>
                     <th>Assembly Station</th>
                     <th>Item Type</th>
-                    <th>PN Type</th>
                     <th>Qty</th>
                     <th>Action</th>
                   </tr>
@@ -465,14 +464,13 @@
                     <td>{{ child.son_description }}</td>
                     <td>{{ child.station_code ? child.station_code + ' - ' + child.station_name : '-' }}</td>
                     <td>{{ child.item_type }}</td>
-                    <td>{{ child.pn_type }}</td>
                     <td>{{ child.qty }}</td>
                     <td class="bom-actions-cell">
                       <button type="button" class="danger-button" (click)="deleteBomChild(child)">Delete</button>
                     </td>
                   </tr>
                   <tr *ngIf="bomChildren.length === 0">
-                    <td colspan="7" class="routing-empty">No BOM childs found.</td>
+                    <td colspan="6" class="routing-empty">No BOM childs found.</td>
                   </tr>
                 </tbody>
               </table>
@@ -823,7 +821,6 @@
             <th>Description</th>
             <th>Station</th>
             <th>Item Type</th>
-            <th>PN Type</th>
             <th>Qty</th>
           </tr>
         </thead>
@@ -833,7 +830,6 @@
             <td>{{ child.son_description }}</td>
             <td>{{ child.station_code }} - {{ child.station_name }}</td>
             <td>{{ child.item_type }}</td>
-            <td>{{ child.pn_type }}</td>
             <td>{{ child.qty }}</td>
           </tr>
         </tbody>

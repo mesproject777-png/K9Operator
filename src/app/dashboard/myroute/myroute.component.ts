@@ -214,6 +214,10 @@ export class MyrouteComponent implements OnDestroy {
       return true;
     }
 
+    if (eventType === 'BOM_BIND') {
+      return true;
+    }
+
     if (eventType && eventType !== 'PASS') {
       return false;
     }

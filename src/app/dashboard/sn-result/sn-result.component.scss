@@ -1,7 +1,13 @@
+:host {
+  display: block;
+  width: 100%;
+}
+
 .sn-result-page {
   min-height: calc(100vh - 120px);
   display: flex;
   align-items: stretch;
+  width: 100%;
 }
 
 .sn-result-window {
@@ -1049,6 +1055,22 @@ button.preview-node:focus-visible {
   font-size: 0.8rem;
   font-weight: 900;
   text-transform: uppercase;
+}
+
+.history-link-button {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #0d72df;
+  font: inherit;
+  font-weight: 950;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.history-link-button:hover {
+  color: #084f9f;
 }
 
 .result-chip {

@@ -17,6 +17,7 @@ import { Subscription } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import {
   TraceabilityService,
+  TraceAssembledPart,
   TraceHistoryRow,
   TraceSearchResponse,
 } from '../../services/traceability.service';
@@ -128,6 +129,13 @@ type SnHistoryDisplayRow = {
   date: string;
   time: string;
   actionDescription: string;
+  eventType?: string;
+  childSn?: string;
+  childPn?: string;
+  childRevision?: string;
+  parentSn?: string;
+  parentPn?: string;
+  parentRevision?: string;
 };
 
 @Component({
@@ -156,6 +164,7 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
   previewConnectorHeight = 0;
   previewFlowCardsPerRow = this.getPreviewFlowCardsPerRow();
   isChildDetailsOpen = false;
+  isAssembledPartsOpen = false;
   activePreviewStation: PreviewStationNode | null = null;
   activePreviewLogistics: PreviewFlowNode | null = null;
   previewStationStatusById: Record<number, PreviewStatus> = {};
@@ -303,8 +312,16 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
   }
 
   get boxRightLabel(): string {
-    const qty = this.workflowSnapshot?.workOrder?.qty;
-    return qty && qty > 0 ? `Qty ${qty}` : this.traceResult?.serial?.status || '-';
+    return 'Assembled parts';
+  }
+
+  get assembledParts(): TraceAssembledPart[] {
+    return this.traceResult?.assembled_parts || [];
+  }
+
+  get assembledPartsSummary(): string {
+    const count = this.assembledParts.length;
+    return count === 1 ? '1 Part' : `${count} Parts`;
   }
 
   get historyRows(): TraceHistoryRow[] {
@@ -312,7 +329,7 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
   }
 
   get snHistoryDisplayRows(): SnHistoryDisplayRow[] {
-    const displayRows = this.historyRows.map((history) => {
+    const displayRows: SnHistoryDisplayRow[] = this.historyRows.map((history) => {
         const dateTime = this.parseHistoryDate(history.date_time);
 
         return {
@@ -321,6 +338,13 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
           date: dateTime.date,
           time: dateTime.time,
           actionDescription: this.buildHistoryActionDescription(history),
+          eventType: history.event_type,
+          childSn: history.child_sn,
+          childPn: history.child_pn,
+          childRevision: history.child_revision,
+          parentSn: history.parent_sn,
+          parentPn: history.parent_pn,
+          parentRevision: history.parent_revision,
         };
       });
 
@@ -501,6 +525,38 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
     return result || '-';
   }
 
+  openSerialChart(serial: string | null | undefined): void {
+    const query = String(serial || '').trim();
+    if (!query) {
+      return;
+    }
+
+    this.isChildDetailsOpen = false;
+    this.activePreviewStation = null;
+    this.router.navigate(['/dashboard/operator'], {
+      queryParams: { q: query, t: Date.now() },
+    });
+  }
+
+  isCurrentHistorySerial(serial: string | null | undefined): boolean {
+    return String(serial || '').trim().toUpperCase() === String(this.serialNumber || '').trim().toUpperCase();
+  }
+
+  isBomBindHistory(row: SnHistoryDisplayRow): boolean {
+    return String(row.eventType || '').trim().toUpperCase() === 'BOM_BIND';
+  }
+
+  formatPartRevision(partNumber: string | null | undefined, revision: string | null | undefined): string {
+    const pn = String(partNumber || '').trim();
+    const rev = String(revision || '').trim();
+
+    if (!pn) {
+      return '';
+    }
+
+    return rev && rev !== '-' ? `${pn} / ${rev}` : pn;
+  }
+
   private parseHistoryDate(value: string | null | undefined): { date: string; time: string } {
     const parsedDate = value ? new Date(value) : null;
 
@@ -541,6 +597,10 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
       return true;
     }
 
+    if (eventType === 'BOM_BIND') {
+      return true;
+    }
+
     if (eventType && eventType !== 'PASS') {
       return false;
     }
@@ -555,7 +615,7 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
       return false;
     }
 
-    return action.startsWith('PASS') || action.startsWith('SN_GENERATED');
+    return action.startsWith('PASS') || action.startsWith('SN_GENERATED') || action.includes('BOM_BIND');
   }
 
   private hasGeneratedHistoryRow(rows: TraceHistoryRow[]): boolean {
@@ -576,6 +636,14 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
 
   closeChildDetails(): void {
     this.isChildDetailsOpen = false;
+  }
+
+  openAssembledParts(): void {
+    this.isAssembledPartsOpen = true;
+  }
+
+  closeAssembledParts(): void {
+    this.isAssembledPartsOpen = false;
   }
 
   openPreviewStationDetails(event: Event, station?: PreviewStationNode | null): void {
@@ -634,6 +702,7 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
     this.workflowSnapshot = null;
     this.previewStationStatusById = {};
     this.isChildDetailsOpen = false;
+    this.isAssembledPartsOpen = false;
     this.activePreviewStation = null;
     this.activePreviewLogistics = null;
 

@@ -4959,13 +4959,15 @@ public static class ConvertedEndpoints
         return await QueryRowsAsync(
             connection,
             """
-            SELECT id, son_pn, son_description, COALESCE(station_code, '') AS station_code,
-                   COALESCE(station_name, '') AS station_name, COALESCE(item_type, '') AS item_type,
-                   COALESCE(pn_type, '') AS pn_type, qty
-            FROM workflow_bom_children
-            WHERE workflow_part_id = @workflowPartId
-              AND UPPER(COALESCE(station_code, '')) = UPPER(@stationCode)
-            ORDER BY id ASC
+            SELECT b.id, b.son_pn, b.son_description, COALESCE(b.station_code, '') AS station_code,
+                   COALESCE(b.station_name, '') AS station_name, COALESCE(b.item_type, '') AS item_type,
+                   COALESCE(pt.code, pt.type, '') AS pn_type, b.qty
+            FROM workflow_bom_children b
+            LEFT JOIN workflow_part_numbers child_part ON UPPER(BTRIM(child_part.pn)) = UPPER(BTRIM(b.son_pn))
+            LEFT JOIN pn_types pt ON pt.id = child_part.pn_type_id
+            WHERE b.workflow_part_id = @workflowPartId
+              AND UPPER(COALESCE(b.station_code, '')) = UPPER(@stationCode)
+            ORDER BY b.id ASC
             """,
             ("workflowPartId", workflowPartId),
             ("stationCode", stationCode));
@@ -5304,6 +5306,7 @@ public static class ConvertedEndpoints
     {
         var routeRows = await GetRouteRowsForItemAsync(connection, Convert.ToInt32(serial["item_id"]));
         var currentOrder = routeRows.Count == 0 ? 0 : ResolveCurrentOrder(serial, routeRows);
+        var assembledParts = await GetSerialAssembledPartsAsync(connection, serial["id"]!);
         var history = await QueryRowsAsync(
             connection,
             """
@@ -5380,6 +5383,7 @@ public static class ConvertedEndpoints
             progress = new { total = routing.Count, completed, current = current is null ? 0 : 1, pending, percent },
             routing,
             history,
+            assembled_parts = assembledParts,
             generated_at = DateTime.UtcNow
         };
     }
@@ -5406,6 +5410,7 @@ public static class ConvertedEndpoints
         var multiboxNo = multiboxRows.Count > 0 ? multiboxRows[0]["box_no"] : null;
         var palletNo = multiboxRows.Count > 0 ? multiboxRows[0]["pallet_no"] : null;
         var shipmentNo = multiboxRows.Count > 0 ? multiboxRows[0]["shipment_no"] : null;
+        var assembledParts = await GetWorkflowSerialAssembledPartsAsync(connection, serial["id"]!);
         var history = await QueryRowsAsync(
             connection,
             """
@@ -5490,8 +5495,54 @@ public static class ConvertedEndpoints
             progress = new { total = routing.Count, completed, current = current is null ? 0 : 1, pending, percent },
             routing,
             history,
+            assembled_parts = assembledParts,
             generated_at = DateTime.UtcNow
         };
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetSerialAssembledPartsAsync(
+        NpgsqlConnection connection,
+        object serialId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT child_item.pn,
+                   child.sn AS son_sn,
+                   COALESCE(pt.code, pt.type, '') AS pn_type,
+                   l.station_code,
+                   ''::text AS station_name
+            FROM serial_assembly_links l
+            JOIN serial_numbers child ON child.id = l.child_serial_id
+            JOIN items child_item ON child_item.id = child.item_id
+            LEFT JOIN pn_types pt ON pt.id = child_item.pn_type_id
+            WHERE l.parent_serial_id = @serialId
+            ORDER BY l.created_at DESC, l.id DESC
+            """,
+            ("serialId", serialId));
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowSerialAssembledPartsAsync(
+        NpgsqlConnection connection,
+        object workflowSerialId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT child_part.pn,
+                   child.sn AS son_sn,
+                   COALESCE(pt.code, pt.type, '') AS pn_type,
+                   l.station_code,
+                   COALESCE(l.station_name, child_bom.station_name, '') AS station_name
+            FROM workflow_serial_bom_bindings l
+            JOIN workflow_serial_numbers child ON child.id = l.child_workflow_serial_id
+            JOIN workflow_part_numbers child_part ON child_part.id = child.workflow_part_id
+            LEFT JOIN workflow_bom_children child_bom ON child_bom.id = l.workflow_bom_child_id
+            LEFT JOIN pn_types pt ON pt.id = child_part.pn_type_id
+            WHERE l.parent_workflow_serial_id = @serialId
+            ORDER BY l.created_at DESC, l.id DESC
+            """,
+            ("serialId", workflowSerialId));
     }
 
     private static async Task<List<Dictionary<string, object?>>> GetWorkflowBomBindingHistoryRowsAsync(
@@ -5800,9 +5851,9 @@ public static class ConvertedEndpoints
                         connection,
                         """
                         INSERT INTO workflow_bom_children
-                          (workflow_part_id, son_pn, son_description, station_code, station_name, item_type, pn_type, qty)
+                          (workflow_part_id, son_pn, son_description, station_code, station_name, item_type, qty)
                         VALUES
-                          (@workflowPartId, @sonPn, @sonDescription, @stationCode, @stationName, @itemType, @pnType, @qty)
+                          (@workflowPartId, @sonPn, @sonDescription, @stationCode, @stationName, @itemType, @qty)
                         """,
                         ("workflowPartId", workflowPartId),
                         ("sonPn", sonPn),
@@ -5810,7 +5861,6 @@ public static class ConvertedEndpoints
                         ("stationCode", ToDbNullable(ReadString(row, "station_code")?.Trim())),
                         ("stationName", ToDbNullable(ReadString(row, "station_name")?.Trim())),
                         ("itemType", ToDbNullable(ReadString(row, "item_type")?.Trim())),
-                        ("pnType", ToDbNullable(ReadString(row, "pn_type")?.Trim())),
                         ("qty", ReadInt(row, "qty") ?? 1));
                 }
             }
@@ -6484,7 +6534,7 @@ public static class ConvertedEndpoints
             var bomRows = await QueryRowsAsync(
                 connection,
                 """
-                SELECT id, son_pn, son_description, station_code, station_name, item_type, pn_type, qty
+                SELECT id, son_pn, son_description, station_code, station_name, item_type, qty
                 FROM workflow_bom_children
                 WHERE workflow_part_id = @workflowPartId
                 ORDER BY id ASC
@@ -7312,12 +7362,12 @@ public static class ConvertedEndpoints
               station_code VARCHAR(80),
               station_name VARCHAR(220),
               item_type VARCHAR(40),
-              pn_type VARCHAR(80),
               qty INTEGER NOT NULL CHECK (qty > 0),
               created_at TIMESTAMP NOT NULL DEFAULT NOW(),
               updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
             """);
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_bom_children DROP COLUMN IF EXISTS pn_type");
 
         await ExecuteAsync(
             connection,

@@ -72,6 +72,14 @@ export interface TraceHistoryRow {
   parent_revision?: string;
 }
 
+export interface TraceAssembledPart {
+  pn: string;
+  son_sn: string;
+  pn_type: string;
+  station_code: string;
+  station_name?: string | null;
+}
+
 export interface TraceSearchResponse {
   query: string;
   matched_by: 'SN' | 'RSN';
@@ -80,6 +88,7 @@ export interface TraceSearchResponse {
   progress: TraceProgress;
   routing: TraceRouteStep[];
   history: TraceHistoryRow[];
+  assembled_parts?: TraceAssembledPart[];
   generated_at: string;
 }
 

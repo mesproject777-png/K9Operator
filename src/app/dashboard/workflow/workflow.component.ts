@@ -86,7 +86,6 @@ type BomChildRow = {
   station_code: string;
   station_name: string;
   item_type: string;
-  pn_type: string;
   qty: number;
 };
 
@@ -1204,7 +1203,6 @@ export class WorkflowComponent implements OnInit, AfterViewInit, AfterViewChecke
         station_code: selectedStation?.station_code || '',
         station_name: selectedStation?.station_name || '',
         item_type: 'Manufactured',
-        pn_type: '-',
         qty: Number(formValue.qty),
       };
 
@@ -1860,7 +1858,6 @@ export class WorkflowComponent implements OnInit, AfterViewInit, AfterViewChecke
       station_code: child.station_code || '',
       station_name: child.station_name || '',
       item_type: child.item_type || 'Manufactured',
-      pn_type: child.pn_type || '-',
       qty: Number(child.qty) || 1,
     }));
 

@@ -108,6 +108,12 @@ export class DashboardComponent implements OnDestroy {
     this.searchSerialNumber();
   }
 
+  get shouldShowLabelPrinterControls(): boolean {
+    const currentUrl = this.router.parseUrl(this.router.url);
+    const path = currentUrl.root.children['primary']?.segments.map((segment) => segment.path).join('/') || '';
+    return path === 'dashboard/operator' && !currentUrl.queryParams['q'];
+  }
+
   loadLabelPrinterConfig(silent = false): void {
     const loginId = this.currentUser?.login_id;
     if (!loginId) {
