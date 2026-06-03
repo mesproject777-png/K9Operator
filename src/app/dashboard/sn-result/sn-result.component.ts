@@ -21,6 +21,35 @@ import {
   TraceSearchResponse,
 } from '../../services/traceability.service';
 
+type StationLabelPrintingConfig = {
+  stationId: number | null;
+  stationName: string;
+  isLabelPrintingEnabled: boolean;
+  labelCode: string;
+  labelDescription: string;
+  printerId: string;
+  printerName: string;
+  ipAddress: string;
+  port: string;
+  status: string;
+};
+
+type LabelMasterDto = {
+  id: number;
+  label_code: string;
+  label_description: string;
+  status: string;
+};
+
+type LabelPrnTemplateDto = {
+  id: number;
+  label_master_id: number;
+  prn_file_name: string;
+  prn_content: string;
+  preview_data?: string | null;
+  version: number;
+};
+
 type SnResultTab = 'preview' | 'history';
 type PreviewStatus = 'Passed' | 'In Progress' | 'Pending' | 'Skipped';
 
@@ -59,6 +88,7 @@ type WorkflowSnapshot = {
     qty: number;
   }>;
   stationRules?: Record<string, string[]>;
+  stationLabelPrinting?: Record<string, StationLabelPrintingConfig>;
   previewStatuses?: Record<string, PreviewStatus>;
 };
 
@@ -131,6 +161,10 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
   private routeSub: Subscription | null = null;
   private previewConnectorFrame: number | null = null;
   private previewConnectorSignature = '';
+  stationLabelConfig: StationLabelPrintingConfig | null = null;
+  availableLabels: LabelMasterDto[] = [];
+  isLabelPreviewOpen = false;
+  labelPreviewText = '';
   @ViewChild('previewProcessFlow') private previewProcessFlowRef?: ElementRef<HTMLElement>;
   @ViewChildren('previewFlowNode') private previewFlowNodeRefs?: QueryList<ElementRef<HTMLElement>>;
 
@@ -142,6 +176,7 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
     private location: Location,
     private cdr: ChangeDetectorRef
   ) {
+    this.loadAvailableLabels();
     this.routeSub = this.route.queryParamMap.subscribe((params) => {
       const serial = String(params.get('q') || '').trim();
       if (!serial) {
@@ -567,6 +602,20 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
         this.previewLoading = false;
         this.previewMessage = snapshot?.routing?.length ? '' : 'No preview data found for this serial number.';
         this.queuePreviewConnectorRefresh();
+        // detect station label printing configuration for current station
+        try {
+          const currentStationCode = String(this.traceResult?.serial?.current_station_code || '').trim() ||
+            String((snapshot as any)?.routing?.find((r: any) => r.is_current)?.station_code || '').trim();
+
+          if (currentStationCode && (snapshot as any)?.stationLabelPrinting) {
+            const config = (snapshot as any).stationLabelPrinting[currentStationCode];
+            this.stationLabelConfig = config?.isLabelPrintingEnabled ? config : null;
+          } else {
+            this.stationLabelConfig = null;
+          }
+        } catch {
+          this.stationLabelConfig = null;
+        }
       },
       error: () => {
         this.workflowSnapshot = null;
@@ -574,6 +623,90 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
         this.previewMessage = 'No preview data found for this serial number.';
       },
     });
+  }
+
+  private loadAvailableLabels(): void {
+    this.http.get<{ data: LabelMasterDto[] }>(`${environment.apiUrl}/api/labels`).subscribe({
+      next: (response) => {
+        this.availableLabels = (response?.data || []).filter((l) => l.status !== 'Inactive');
+      },
+      error: () => {
+        this.availableLabels = [];
+      }
+    });
+  }
+
+  openLabelPreview(): void {
+    if (!this.stationLabelConfig || !this.stationLabelConfig.labelCode) {
+      return;
+    }
+
+    const code = String(this.stationLabelConfig.labelCode || '').trim().toLowerCase();
+    const label = this.availableLabels.find((l) => String(l.label_code || '').trim().toLowerCase() === code);
+
+    const fetchAndPreview = (labelId: number) => {
+      this.http.get<any>(`${environment.apiUrl}/api/labels/${labelId}`).subscribe({
+        next: (resp) => {
+          const prnContent = resp?.prn_template?.prn_content || resp?.prn_content || '';
+          if (!prnContent) {
+            this.labelPreviewText = 'PRN template not found for this Label Code.';
+            this.isLabelPreviewOpen = true;
+            return;
+          }
+
+          this.labelPreviewText = this.replacePlaceholders(prnContent);
+          this.isLabelPreviewOpen = true;
+        },
+        error: () => {
+          this.labelPreviewText = 'Unable to load PRN template for Label Code.';
+          this.isLabelPreviewOpen = true;
+        }
+      });
+    };
+
+    if (label) {
+      fetchAndPreview(label.id);
+      return;
+    }
+
+    // fallback: reload labels and try again
+    this.http.get<{ data: LabelMasterDto[] }>(`${environment.apiUrl}/api/labels`).subscribe({
+      next: (response) => {
+        this.availableLabels = (response?.data || []).filter((l) => l.status !== 'Inactive');
+        const l = this.availableLabels.find((x) => String(x.label_code || '').trim().toLowerCase() === code);
+        if (l) {
+          fetchAndPreview(l.id);
+        } else {
+          this.labelPreviewText = 'Label Code not found in Labels module.';
+          this.isLabelPreviewOpen = true;
+        }
+      },
+      error: () => {
+        this.labelPreviewText = 'Unable to load Labels list.';
+        this.isLabelPreviewOpen = true;
+      }
+    });
+  }
+
+  closeLabelPreview(): void {
+    this.isLabelPreviewOpen = false;
+    this.labelPreviewText = '';
+  }
+
+  private replacePlaceholders(prnContent: string): string {
+    const mapping: Record<string, string> = {
+      RSN: String(this.traceResult?.serial?.rsn || ''),
+      WO: String(this.traceResult?.device?.work_order || this.workflowSnapshot?.workOrder?.wo || ''),
+      PN: String(this.traceResult?.device?.pn || this.workflowSnapshot?.partNumber?.pn || ''),
+      MODELNO: String(this.traceResult?.device?.product_line || this.workflowSnapshot?.partNumber?.item_type || ''),
+      MACID: '',
+      CHIPID: '',
+      EAN: '',
+      REVISION: String(this.traceResult?.device?.revision || this.workflowSnapshot?.workOrder?.revision || ''),
+      STATION: String(this.traceResult?.serial?.current_station_code || this.stationLabelConfig?.stationName || ''),
+    };
+
+    return prnContent.replace(/\{(RSN|WO|PN|MODELNO|MACID|CHIPID|EAN|REVISION|STATION)\}/gi, (_, key) => mapping[key.toUpperCase()] ?? '');
   }
 
   private getStationIcon(index: number, name: string, code: string, sampleMode: string): string {
