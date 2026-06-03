@@ -51,6 +51,44 @@ interface OperatorPassResponse {
   label_printing?: unknown;
 }
 
+type PackagingMode = 'multibox' | 'pallet' | 'shipment';
+
+interface PackagingItem {
+  seq?: number;
+  id?: number;
+  code?: string;
+  status?: string;
+  item_count?: number;
+  added_by?: string;
+  added_at?: string;
+  sn?: string;
+  rsn?: string;
+}
+
+interface PackagingStatus {
+  enabled: boolean;
+  type?: PackagingMode;
+  id?: number;
+  code?: string;
+  target_qty?: number | null;
+  scanned_qty?: number;
+  remaining_qty?: number | null;
+  is_closed?: boolean;
+  items?: PackagingItem[];
+}
+
+interface PackagingHistoryItem {
+  id: number;
+  code: string;
+  type: 'Multibox' | 'Pallet' | 'Shipment';
+  target_qty?: number | null;
+  item_count: number;
+  status: string;
+  created_by?: string;
+  created_at?: string;
+  closed_at?: string;
+}
+
 @Component({
   selector: 'app-operator',
   standalone: false,
@@ -69,22 +107,13 @@ export class OperatorComponent implements OnDestroy {
   isMultiboxOpen = false;
   isMultiboxLoading = false;
   multiboxSerial = '';
-  multiboxStatus: {
-    enabled: boolean;
-    box_qty?: number;
-    scanned_qty?: number;
-    remaining_qty?: number;
-    box_no?: string;
-    is_closed?: boolean;
-    items?: Array<{
-      seq?: number;
-      sn?: string;
-      rsn?: string;
-      status?: string;
-      added_by?: string;
-      added_at?: string;
-    }>;
-  } | null = null;
+  multiboxStatus: PackagingStatus | null = null;
+  activePackagingMode: PackagingMode = 'multibox';
+  packagingScanValue = '';
+  packagingTargetQty: number | null = null;
+  isHistoryOpen = false;
+  isHistoryLoading = false;
+  packagingHistory: PackagingHistoryItem[] = [];
   successMessage = '';
   errorMessage = '';
   bindingContext: OperatorAssemblyStatusResponse | null = null;
@@ -310,27 +339,41 @@ export class OperatorComponent implements OnDestroy {
   }
 
   toggleMultibox(): void {
+    this.openPackagingMode('multibox');
+  }
+
+  openPackagingMode(mode: PackagingMode): void {
     this.errorMessage = '';
     this.successMessage = '';
+    this.activePackagingMode = mode;
     this.isMultiboxOpen = true;
-    this.loadMultiboxStatus();
+    this.packagingScanValue = '';
+    this.loadPackagingStatus();
   }
 
   loadMultiboxStatus(): void {
+    this.loadPackagingStatus();
+  }
+
+  loadPackagingStatus(): void {
     if (!this.currentUser?.login_id) {
       return;
     }
 
     this.isMultiboxLoading = true;
-    this.http.get<any>(`${this.apiUrl}/multibox/status`, {
+    const endpoint = this.activePackagingMode === 'multibox'
+      ? `${this.apiUrl}/multibox/status`
+      : `${this.apiUrl}/${this.activePackagingMode}/status`;
+    this.http.get<any>(endpoint, {
       params: { loginId: this.currentUser.login_id }
     }).subscribe({
       next: (status) => {
-        this.multiboxStatus = status;
+        this.multiboxStatus = this.normalizePackagingStatus(status);
+        this.packagingTargetQty = this.multiboxStatus?.target_qty ?? null;
         this.isMultiboxLoading = false;
       },
       error: (error) => {
-        this.errorMessage = error?.error?.message || 'Unable to load multibox status.';
+        this.errorMessage = error?.error?.message || `Unable to load ${this.activePackagingLabel.toLowerCase()} status.`;
         this.isMultiboxLoading = false;
       }
     });
@@ -338,7 +381,7 @@ export class OperatorComponent implements OnDestroy {
 
   submitSerial(): void {
     if (this.canUseMultibox()) {
-      this.scanMultiboxSerial(this.serialNumber);
+      this.scanMultiboxSerial();
       return;
     }
 
@@ -349,9 +392,9 @@ export class OperatorComponent implements OnDestroy {
     this.errorMessage = '';
     this.successMessage = '';
 
-    const query = String(value ?? this.multiboxSerial).trim();
+    const query = String(value ?? this.currentScanValue).trim();
     if (!query) {
-      this.errorMessage = 'Please enter serial number.';
+      this.errorMessage = `Please enter ${this.scanLabel.toLowerCase()}.`;
       return;
     }
 
@@ -360,32 +403,41 @@ export class OperatorComponent implements OnDestroy {
       return;
     }
 
+    if (this.activePackagingMode !== 'multibox' && (!this.packagingTargetQty || this.packagingTargetQty <= 0)) {
+      this.errorMessage = `Please enter ${this.activePackagingLabel.toLowerCase()} quantity.`;
+      return;
+    }
+
     this.isMultiboxLoading = true;
-    this.http.post<any>(`${this.apiUrl}/multibox/scan`, {
+    const endpoint = this.activePackagingMode === 'multibox'
+      ? `${this.apiUrl}/multibox/scan`
+      : `${this.apiUrl}/${this.activePackagingMode}/scan`;
+    const body: Record<string, unknown> = {
       loginId: this.currentUser.login_id,
       query
-    }).subscribe({
+    };
+    if (this.activePackagingMode !== 'multibox') {
+      body['targetQty'] = this.packagingTargetQty;
+    }
+
+    this.http.post<any>(endpoint, body).subscribe({
       next: (response) => {
-        this.multiboxStatus = {
-          enabled: true,
-          box_qty: response.box_qty,
-          scanned_qty: response.scanned_qty,
-          remaining_qty: response.remaining_qty,
-          box_no: response.box_no,
-          is_closed: response.is_closed,
-          items: response.items || []
-        };
+        this.multiboxStatus = this.normalizePackagingStatus(response);
+        this.packagingTargetQty = this.multiboxStatus.target_qty ?? this.packagingTargetQty;
         this.multiboxSerial = '';
+        this.packagingScanValue = '';
         this.serialNumber = '';
         this.displayedSerial = query;
         this.showResultPanel = false;
         this.isPassed = true;
-        this.successMessage = response?.message || 'Serial added to box.';
+        this.successMessage = response?.message || `${this.scanLabel} added.`;
         this.isMultiboxLoading = false;
-        this.router.navigate(['/dashboard/operator']);
+        if (this.isHistoryOpen) {
+          this.loadPackagingHistory();
+        }
       },
       error: (error) => {
-        this.errorMessage = error?.error?.message || 'Unable to scan serial into box.';
+        this.errorMessage = error?.error?.message || `Unable to scan ${this.scanLabel.toLowerCase()}.`;
         this.isMultiboxLoading = false;
       }
     });
@@ -396,6 +448,114 @@ export class OperatorComponent implements OnDestroy {
   }
 
   get multiboxProgressText(): string {
-    return `${this.multiboxStatus?.scanned_qty || 0} / ${this.multiboxStatus?.box_qty || this.currentUser?.box_qty || 0}`;
+    const total = this.activePackagingMode === 'multibox'
+      ? (this.multiboxStatus?.target_qty || this.currentUser?.box_qty || 0)
+      : (this.packagingTargetQty || this.multiboxStatus?.target_qty || 0);
+    return `${this.multiboxStatus?.scanned_qty || 0} / ${total}`;
+  }
+
+  get activePackagingLabel(): string {
+    if (this.activePackagingMode === 'pallet') {
+      return 'Pallet';
+    }
+
+    if (this.activePackagingMode === 'shipment') {
+      return 'Shipment';
+    }
+
+    return 'Multibox';
+  }
+
+  get activePackagingCode(): string {
+    return this.multiboxStatus?.code || 'Generating...';
+  }
+
+  get activePackagingIcon(): string {
+    if (this.activePackagingMode === 'pallet') {
+      return 'pallet';
+    }
+
+    if (this.activePackagingMode === 'shipment') {
+      return 'local_shipping';
+    }
+
+    return 'inventory_2';
+  }
+
+  get scanLabel(): string {
+    if (this.activePackagingMode === 'pallet') {
+      return 'Multibox Number';
+    }
+
+    if (this.activePackagingMode === 'shipment') {
+      return 'Pallet Number';
+    }
+
+    return 'Product Serial';
+  }
+
+  get currentScanValue(): string {
+    return this.activePackagingMode === 'multibox' ? this.serialNumber : this.packagingScanValue;
+  }
+
+  set currentScanValue(value: string) {
+    if (this.activePackagingMode === 'multibox') {
+      this.serialNumber = value;
+      return;
+    }
+
+    this.packagingScanValue = value;
+  }
+
+  get isActivePackagingClosed(): boolean {
+    return !!this.multiboxStatus?.is_closed;
+  }
+
+  get remainingText(): string {
+    const remaining = this.multiboxStatus?.remaining_qty;
+    return remaining === null || remaining === undefined ? '-' : String(remaining);
+  }
+
+  showHistory(): void {
+    this.isHistoryOpen = true;
+    this.loadPackagingHistory();
+  }
+
+  closeHistory(): void {
+    this.isHistoryOpen = false;
+  }
+
+  loadPackagingHistory(): void {
+    if (!this.currentUser?.login_id) {
+      return;
+    }
+
+    this.isHistoryLoading = true;
+    this.http.get<{ data: PackagingHistoryItem[] }>(`${this.apiUrl}/packaging/history`, {
+      params: { loginId: this.currentUser.login_id }
+    }).subscribe({
+      next: (response) => {
+        this.packagingHistory = response.data || [];
+        this.isHistoryLoading = false;
+      },
+      error: (error) => {
+        this.errorMessage = error?.error?.message || 'Unable to load packaging history.';
+        this.isHistoryLoading = false;
+      }
+    });
+  }
+
+  private normalizePackagingStatus(status: any): PackagingStatus {
+    return {
+      enabled: status?.enabled !== false,
+      type: this.activePackagingMode,
+      id: status?.id,
+      code: status?.code || status?.box_no || status?.pallet_no || status?.shipment_no,
+      target_qty: status?.target_qty ?? status?.box_qty ?? null,
+      scanned_qty: status?.scanned_qty ?? 0,
+      remaining_qty: status?.remaining_qty ?? null,
+      is_closed: !!status?.is_closed,
+      items: status?.items || []
+    };
   }
 }

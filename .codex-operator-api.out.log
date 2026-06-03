@@ -1,6 +1,10 @@
 
 > k9-operator@0.0.0 start:api
-> dotnet run --project backend/K9Api
+> npm run stop:api && dotnet run --project backend/K9Api --urls http://localhost:5001
+
+
+> k9-operator@0.0.0 stop:api
+> powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-k9-operator-api.ps1
 
 info: Microsoft.Hosting.Lifetime[14]
       Now listening on: http://localhost:5001

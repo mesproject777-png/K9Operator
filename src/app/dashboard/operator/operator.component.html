@@ -3,34 +3,57 @@
     <app-sn-result *ngIf="showResultPanel"></app-sn-result>
 
     <ng-container *ngIf="!showResultPanel && canUseMultibox(); else standardOperatorView">
-      <button type="button" class="multibox-corner-button" [class.active]="isMultiboxOpen" (click)="toggleMultibox()">
-        <span class="material-symbols-outlined">inventory_2</span>
-        <span>New Multibox</span>
-      </button>
+      <div class="packaging-actions">
+        <button type="button" class="multibox-corner-button" [class.active]="isMultiboxOpen && activePackagingMode === 'multibox'" (click)="openPackagingMode('multibox')">
+          <span class="material-symbols-outlined">inventory_2</span>
+          <span>New Multibox</span>
+        </button>
+        <button type="button" class="multibox-corner-button pallet-button" [class.active]="isMultiboxOpen && activePackagingMode === 'pallet'" (click)="openPackagingMode('pallet')">
+          <span class="material-symbols-outlined">pallet</span>
+          <span>New Pallet</span>
+        </button>
+        <button type="button" class="multibox-corner-button shipment-button" [class.active]="isMultiboxOpen && activePackagingMode === 'shipment'" (click)="openPackagingMode('shipment')">
+          <span class="material-symbols-outlined">local_shipping</span>
+          <span>New Shipment</span>
+        </button>
+      </div>
 
       <section class="multibox-workspace" *ngIf="isMultiboxOpen">
         <header class="multibox-header">
           <div>
-            <span class="eyebrow">Box Serial</span>
-            <h2>{{ multiboxStatus?.box_no || 'Generating...' }}</h2>
+            <span class="eyebrow">{{ activePackagingLabel }} Serial</span>
+            <h2>{{ activePackagingCode }}</h2>
           </div>
           <div class="multibox-count">
             <strong>{{ multiboxProgressText }}</strong>
-            <span>{{ multiboxStatus?.remaining_qty || currentUser?.box_qty || 0 }} remaining</span>
+            <span>{{ remainingText }} remaining</span>
           </div>
         </header>
 
         <div class="multibox-scan-row">
+          <div class="serial-entry qty-entry" *ngIf="activePackagingMode !== 'multibox'">
+            <label for="packagingQty">{{ activePackagingLabel }} Qty</label>
+            <input
+              id="packagingQty"
+              type="number"
+              min="1"
+              [(ngModel)]="packagingTargetQty"
+              name="packagingQty"
+              placeholder="Enter quantity"
+              [disabled]="isMultiboxLoading || isActivePackagingClosed || (multiboxStatus?.scanned_qty || 0) > 0"
+            />
+          </div>
+
           <div class="serial-entry">
-            <label for="operatorSerial">Product Serial</label>
+            <label for="operatorSerial">{{ scanLabel }}</label>
             <input
               id="operatorSerial"
               type="text"
-              [(ngModel)]="serialNumber"
+              [(ngModel)]="currentScanValue"
               name="operatorSerial"
-              placeholder="Scan product serial"
+              [placeholder]="'Scan ' + scanLabel.toLowerCase()"
               autocomplete="off"
-              [disabled]="isMultiboxLoading || !!multiboxStatus?.is_closed"
+              [disabled]="isMultiboxLoading || isActivePackagingClosed"
               (keydown.enter)="submitSerial()"
             />
           </div>
@@ -38,7 +61,7 @@
           <button
             type="button"
             class="pass-button"
-            [disabled]="isMultiboxLoading || !!multiboxStatus?.is_closed"
+            [disabled]="isMultiboxLoading || isActivePackagingClosed"
             (click)="submitSerial()"
           >
             {{ isMultiboxLoading ? 'Scanning...' : 'Scan' }}
@@ -55,20 +78,69 @@
             <thead>
               <tr>
                 <th>#</th>
-                <th>SN</th>
-                <th>RSN</th>
+                <th>{{ activePackagingMode === 'multibox' ? 'SN' : activePackagingMode === 'pallet' ? 'Multibox' : 'Pallet' }}</th>
+                <th *ngIf="activePackagingMode !== 'multibox'">Status</th>
+                <th *ngIf="activePackagingMode !== 'multibox'">Qty</th>
                 <th>Scanned At</th>
               </tr>
             </thead>
             <tbody>
               <tr *ngFor="let item of multiboxItems">
                 <td>{{ item.seq }}</td>
-                <td>{{ item.sn || '-' }}</td>
-                <td>{{ item.rsn || '-' }}</td>
+                <td>{{ item.sn || item.code || '-' }}</td>
+                <td *ngIf="activePackagingMode !== 'multibox'">{{ item.status || '-' }}</td>
+                <td *ngIf="activePackagingMode !== 'multibox'">{{ item.item_count || 0 }}</td>
                 <td>{{ item.added_at | date:'short' }}</td>
               </tr>
               <tr *ngIf="multiboxItems.length === 0">
-                <td colspan="4" class="empty-row">No scanned SNs yet.</td>
+                <td [attr.colspan]="activePackagingMode === 'multibox' ? 3 : 5" class="empty-row">No scanned records yet.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <button type="button" class="history-button" (click)="showHistory()">
+        <span class="material-symbols-outlined">history</span>
+        <span>Show History</span>
+      </button>
+
+      <section class="history-panel" *ngIf="isHistoryOpen">
+        <header>
+          <div>
+            <span class="eyebrow">Packaging History</span>
+            <h2>Multibox, Pallet, Shipment</h2>
+          </div>
+          <button type="button" class="close-history-button" (click)="closeHistory()">
+            <span class="material-symbols-outlined">close</span>
+          </button>
+        </header>
+        <div class="scanned-table-wrap">
+          <table class="scanned-table">
+            <thead>
+              <tr>
+                <th>Unique ID</th>
+                <th>Type</th>
+                <th>Qty</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Closed</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr *ngFor="let item of packagingHistory">
+                <td>{{ item.code }}</td>
+                <td>{{ item.type }}</td>
+                <td>{{ item.item_count }} / {{ item.target_qty || '-' }}</td>
+                <td>{{ item.status }}</td>
+                <td>{{ item.created_at | date:'short' }}</td>
+                <td>{{ item.closed_at ? (item.closed_at | date:'short') : '-' }}</td>
+              </tr>
+              <tr *ngIf="!isHistoryLoading && packagingHistory.length === 0">
+                <td colspan="6" class="empty-row">No packaging history yet.</td>
+              </tr>
+              <tr *ngIf="isHistoryLoading">
+                <td colspan="6" class="empty-row">Loading history...</td>
               </tr>
             </tbody>
           </table>

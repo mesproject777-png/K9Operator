@@ -959,6 +959,274 @@ public static class ConvertedEndpoints
             }
         });
 
+        app.MapGet("/api/operator/pallet/status", async (HttpRequest request) =>
+        {
+            var loginId = request.Query["loginId"].ToString().Trim();
+            if (string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonMessage("Login ID is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var station = await GetOperatorStationAsync(connection, loginId);
+            if (station is null)
+            {
+                return JsonMessage("Invalid station login ID", 401);
+            }
+
+            if (!IsPackStation(station["station_code"]?.ToString(), station["station_name"]?.ToString()))
+            {
+                return Results.Json(new { enabled = false });
+            }
+
+            var pallet = await GetOrCreateOpenWorkflowPalletAsync(connection, loginId);
+            return Results.Json(await BuildPalletPayloadAsync(connection, pallet));
+        });
+
+        app.MapPost("/api/operator/pallet/scan", async (HttpContext context) =>
+        {
+            var payload = await ReadJsonBodyAsync(context.Request);
+            var loginId = ReadString(payload, "loginId")?.Trim();
+            var query = ReadString(payload, "query")?.Trim();
+            var targetQty = ReadInt(payload, "targetQty");
+            if (string.IsNullOrWhiteSpace(loginId) || string.IsNullOrWhiteSpace(query))
+            {
+                return JsonMessage("Login ID and multibox number are required", 400);
+            }
+
+            if (targetQty is null || targetQty <= 0)
+            {
+                return JsonMessage("Pallet Qty is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            await using var transaction = await connection.BeginTransactionAsync();
+            try
+            {
+                var station = await GetOperatorStationAsync(connection, loginId);
+                if (station is null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Invalid station login ID", 401);
+                }
+
+                if (!IsPackStation(station["station_code"]?.ToString(), station["station_name"]?.ToString()))
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Pallet is available only for Pack station", 403);
+                }
+
+                var pallet = await GetOrCreateOpenWorkflowPalletAsync(connection, loginId);
+                if (string.Equals(pallet["status"]?.ToString(), "CLOSED", StringComparison.OrdinalIgnoreCase))
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Pallet is already closed", 409);
+                }
+
+                var scannedQty = await ScalarAsync<int>(connection, "SELECT COUNT(*)::int FROM workflow_pallet_items WHERE pallet_id = @palletId", ("palletId", pallet["id"]));
+                if (scannedQty > 0 && Convert.ToInt32(pallet["target_qty"]) != targetQty.Value)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Pallet Qty cannot be changed after scanning", 409);
+                }
+
+                await ExecuteAsync(connection, "UPDATE workflow_pallets SET target_qty = @targetQty, updated_at = NOW() WHERE id = @id", ("targetQty", targetQty.Value), ("id", pallet["id"]));
+                pallet["target_qty"] = targetQty.Value;
+
+                if (scannedQty >= targetQty.Value)
+                {
+                    await ExecuteAsync(connection, "UPDATE workflow_pallets SET status = 'CLOSED', closed_at = COALESCE(closed_at, NOW()), updated_at = NOW() WHERE id = @id", ("id", pallet["id"]));
+                    await transaction.CommitAsync();
+                    return JsonMessage("Pallet Qty reached", 409);
+                }
+
+                var boxes = await QueryRowsAsync(
+                    connection,
+                    "SELECT * FROM workflow_multiboxes WHERE UPPER(box_no) = UPPER(@query) AND status = 'CLOSED' LIMIT 1",
+                    ("query", query));
+                if (boxes.Count == 0)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Closed multibox number not found", 404);
+                }
+
+                await ExecuteAsync(
+                    connection,
+                    "INSERT INTO workflow_pallet_items (pallet_id, box_id, added_by) VALUES (@palletId, @boxId, @loginId)",
+                    ("palletId", pallet["id"]),
+                    ("boxId", boxes[0]["id"]),
+                    ("loginId", loginId));
+
+                scannedQty += 1;
+                if (scannedQty >= targetQty.Value)
+                {
+                    await ExecuteAsync(connection, "UPDATE workflow_pallets SET status = 'CLOSED', closed_at = NOW(), updated_at = NOW() WHERE id = @id", ("id", pallet["id"]));
+                    pallet["status"] = "CLOSED";
+                    pallet["closed_at"] = DateTime.UtcNow;
+                }
+                else
+                {
+                    await ExecuteAsync(connection, "UPDATE workflow_pallets SET updated_at = NOW() WHERE id = @id", ("id", pallet["id"]));
+                }
+
+                await transaction.CommitAsync();
+                pallet = (await QueryRowsAsync(connection, "SELECT * FROM workflow_pallets WHERE id = @id", ("id", pallet["id"])))[0];
+                var response = await BuildPalletPayloadAsync(connection, pallet);
+                response["message"] = scannedQty >= targetQty.Value ? "Pallet completed" : "Multibox added to pallet";
+                return Results.Json(response, statusCode: 201);
+            }
+            catch (PostgresException ex) when (ex.SqlState == "23505")
+            {
+                await transaction.RollbackAsync();
+                return JsonMessage("This multibox is already scanned into a pallet", 409);
+            }
+            catch
+            {
+                await transaction.RollbackAsync();
+                throw;
+            }
+        });
+
+        app.MapGet("/api/operator/shipment/status", async (HttpRequest request) =>
+        {
+            var loginId = request.Query["loginId"].ToString().Trim();
+            if (string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonMessage("Login ID is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var station = await GetOperatorStationAsync(connection, loginId);
+            if (station is null)
+            {
+                return JsonMessage("Invalid station login ID", 401);
+            }
+
+            if (!IsPackStation(station["station_code"]?.ToString(), station["station_name"]?.ToString()))
+            {
+                return Results.Json(new { enabled = false });
+            }
+
+            var shipment = await GetOrCreateOpenWorkflowShipmentAsync(connection, loginId);
+            return Results.Json(await BuildShipmentPayloadAsync(connection, shipment));
+        });
+
+        app.MapPost("/api/operator/shipment/scan", async (HttpContext context) =>
+        {
+            var payload = await ReadJsonBodyAsync(context.Request);
+            var loginId = ReadString(payload, "loginId")?.Trim();
+            var query = ReadString(payload, "query")?.Trim();
+            var targetQty = ReadInt(payload, "targetQty");
+            if (string.IsNullOrWhiteSpace(loginId) || string.IsNullOrWhiteSpace(query))
+            {
+                return JsonMessage("Login ID and pallet number are required", 400);
+            }
+
+            if (targetQty is null || targetQty <= 0)
+            {
+                return JsonMessage("Shipment Qty is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            await using var transaction = await connection.BeginTransactionAsync();
+            try
+            {
+                var station = await GetOperatorStationAsync(connection, loginId);
+                if (station is null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Invalid station login ID", 401);
+                }
+
+                if (!IsPackStation(station["station_code"]?.ToString(), station["station_name"]?.ToString()))
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Shipment is available only for Pack station", 403);
+                }
+
+                var shipment = await GetOrCreateOpenWorkflowShipmentAsync(connection, loginId);
+                var scannedQty = await ScalarAsync<int>(connection, "SELECT COUNT(*)::int FROM workflow_shipment_items WHERE shipment_id = @shipmentId", ("shipmentId", shipment["id"]));
+                if (scannedQty > 0 && Convert.ToInt32(shipment["target_qty"]) != targetQty.Value)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Shipment Qty cannot be changed after scanning", 409);
+                }
+
+                await ExecuteAsync(connection, "UPDATE workflow_shipments SET target_qty = @targetQty, updated_at = NOW() WHERE id = @id", ("targetQty", targetQty.Value), ("id", shipment["id"]));
+                shipment["target_qty"] = targetQty.Value;
+
+                if (scannedQty >= targetQty.Value)
+                {
+                    await ExecuteAsync(connection, "UPDATE workflow_shipments SET status = 'CLOSED', closed_at = COALESCE(closed_at, NOW()), updated_at = NOW() WHERE id = @id", ("id", shipment["id"]));
+                    await transaction.CommitAsync();
+                    return JsonMessage("Shipment Qty reached", 409);
+                }
+
+                var pallets = await QueryRowsAsync(
+                    connection,
+                    "SELECT * FROM workflow_pallets WHERE UPPER(pallet_no) = UPPER(@query) AND status = 'CLOSED' LIMIT 1",
+                    ("query", query));
+                if (pallets.Count == 0)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Closed pallet number not found", 404);
+                }
+
+                await ExecuteAsync(
+                    connection,
+                    "INSERT INTO workflow_shipment_items (shipment_id, pallet_id, added_by) VALUES (@shipmentId, @palletId, @loginId)",
+                    ("shipmentId", shipment["id"]),
+                    ("palletId", pallets[0]["id"]),
+                    ("loginId", loginId));
+
+                scannedQty += 1;
+                if (scannedQty >= targetQty.Value)
+                {
+                    await ExecuteAsync(connection, "UPDATE workflow_shipments SET status = 'CLOSED', closed_at = NOW(), updated_at = NOW() WHERE id = @id", ("id", shipment["id"]));
+                    shipment["status"] = "CLOSED";
+                    shipment["closed_at"] = DateTime.UtcNow;
+                }
+                else
+                {
+                    await ExecuteAsync(connection, "UPDATE workflow_shipments SET updated_at = NOW() WHERE id = @id", ("id", shipment["id"]));
+                }
+
+                await transaction.CommitAsync();
+                shipment = (await QueryRowsAsync(connection, "SELECT * FROM workflow_shipments WHERE id = @id", ("id", shipment["id"])))[0];
+                var response = await BuildShipmentPayloadAsync(connection, shipment);
+                response["message"] = scannedQty >= targetQty.Value ? "Shipment completed" : "Pallet added to shipment";
+                return Results.Json(response, statusCode: 201);
+            }
+            catch (PostgresException ex) when (ex.SqlState == "23505")
+            {
+                await transaction.RollbackAsync();
+                return JsonMessage("This pallet is already scanned into a shipment", 409);
+            }
+            catch
+            {
+                await transaction.RollbackAsync();
+                throw;
+            }
+        });
+
+        app.MapGet("/api/operator/packaging/history", async (HttpRequest request) =>
+        {
+            var loginId = request.Query["loginId"].ToString().Trim();
+            if (string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonMessage("Login ID is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var rows = await GetWorkflowPackagingHistoryAsync(connection, loginId);
+            return Results.Json(new { data = rows });
+        });
+
         app.MapPost("/api/operator/pass", async (HttpContext context) =>
         {
             var payload = await ReadJsonBodyAsync(context.Request);
@@ -3163,6 +3431,53 @@ public static class ConvertedEndpoints
         app.MapGet("/api/packing/open", async () => await ListPackagesAsync("OPEN"));
         app.MapGet("/api/packing/closed", async () => await ListPackagesAsync("CLOSED"));
         app.MapGet("/api/packing/shipped", async () => await ListPackagesAsync("SHIPPED"));
+        app.MapGet("/api/packing/hierarchy", async (HttpRequest request) =>
+        {
+            var query = request.Query["query"].ToString().Trim();
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var rows = await QueryRowsAsync(
+                connection,
+                """
+                SELECT
+                  sn.id AS serial_id,
+                  sn.sn,
+                  sn.rsn,
+                  sn.status AS serial_status,
+                  sn.condition,
+                  wp.pn,
+                  w.wo,
+                  b.box_no AS multibox_no,
+                  b.status AS multibox_status,
+                  p.pallet_no,
+                  p.status AS pallet_status,
+                  s.shipment_no,
+                  s.status AS shipment_status,
+                  COALESCE(si.added_at, pi.added_at, mbi.added_at, sn.updated_at, sn.created_at) AS last_packed_at
+                FROM workflow_serial_numbers sn
+                JOIN workflow_parts wp ON wp.id = sn.workflow_part_id
+                LEFT JOIN workflow_work_orders w ON w.id = sn.workflow_work_order_id
+                LEFT JOIN workflow_multibox_items mbi ON mbi.workflow_serial_id = sn.id
+                LEFT JOIN workflow_multiboxes b ON b.id = mbi.box_id
+                LEFT JOIN workflow_pallet_items pi ON pi.box_id = b.id
+                LEFT JOIN workflow_pallets p ON p.id = pi.pallet_id
+                LEFT JOIN workflow_shipment_items si ON si.pallet_id = p.id
+                LEFT JOIN workflow_shipments s ON s.id = si.shipment_id
+                WHERE NULLIF(@query, '') IS NULL
+                   OR sn.sn ILIKE @pattern
+                   OR sn.rsn ILIKE @pattern
+                   OR wp.pn ILIKE @pattern
+                   OR w.wo ILIKE @pattern
+                   OR b.box_no ILIKE @pattern
+                   OR p.pallet_no ILIKE @pattern
+                   OR s.shipment_no ILIKE @pattern
+                ORDER BY COALESCE(si.added_at, pi.added_at, mbi.added_at, sn.updated_at, sn.created_at) DESC, sn.id DESC
+                LIMIT 500
+                """,
+                ("query", query),
+                ("pattern", $"%{query}%"));
+            return Results.Json(new { data = rows });
+        });
 
         app.MapPost("/api/packing/create", async (HttpContext context) =>
         {
@@ -4264,6 +4579,208 @@ public static class ConvertedEndpoints
             ("boxId", boxId));
     }
 
+    private static async Task<Dictionary<string, object?>> GetOrCreateOpenWorkflowPalletAsync(NpgsqlConnection connection, string loginId)
+    {
+        var existing = await QueryRowsAsync(
+            connection,
+            """
+            SELECT *
+            FROM workflow_pallets
+            WHERE status = 'OPEN'
+              AND created_by = @loginId
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            ("loginId", loginId));
+
+        if (existing.Count > 0)
+        {
+            return existing[0];
+        }
+
+        var palletNo = $"PLT-{DateTime.Now:yyyyMMdd}-{Guid.NewGuid().ToString("N")[..6].ToUpperInvariant()}";
+        var created = await QueryRowsAsync(
+            connection,
+            """
+            INSERT INTO workflow_pallets
+              (pallet_no, target_qty, status, created_by, updated_at)
+            VALUES
+              (@palletNo, 0, 'OPEN', @loginId, NOW())
+            RETURNING *
+            """,
+            ("palletNo", palletNo),
+            ("loginId", loginId));
+
+        return created[0];
+    }
+
+    private static async Task<Dictionary<string, object?>> GetOrCreateOpenWorkflowShipmentAsync(NpgsqlConnection connection, string loginId)
+    {
+        var existing = await QueryRowsAsync(
+            connection,
+            """
+            SELECT *
+            FROM workflow_shipments
+            WHERE status = 'OPEN'
+              AND created_by = @loginId
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            ("loginId", loginId));
+
+        if (existing.Count > 0)
+        {
+            return existing[0];
+        }
+
+        var shipmentNo = $"SHP-{DateTime.Now:yyyyMMdd}-{Guid.NewGuid().ToString("N")[..6].ToUpperInvariant()}";
+        var created = await QueryRowsAsync(
+            connection,
+            """
+            INSERT INTO workflow_shipments
+              (shipment_no, target_qty, status, created_by, updated_at)
+            VALUES
+              (@shipmentNo, 0, 'OPEN', @loginId, NOW())
+            RETURNING *
+            """,
+            ("shipmentNo", shipmentNo),
+            ("loginId", loginId));
+
+        return created[0];
+    }
+
+    private static async Task<Dictionary<string, object?>> BuildPalletPayloadAsync(NpgsqlConnection connection, Dictionary<string, object?> pallet)
+    {
+        var scannedQty = await ScalarAsync<int>(connection, "SELECT COUNT(*)::int FROM workflow_pallet_items WHERE pallet_id = @palletId", ("palletId", pallet["id"]));
+        var targetQty = pallet["target_qty"] is null ? 0 : Convert.ToInt32(pallet["target_qty"]);
+        return new Dictionary<string, object?>
+        {
+            ["enabled"] = true,
+            ["id"] = pallet["id"],
+            ["code"] = pallet["pallet_no"],
+            ["target_qty"] = targetQty,
+            ["scanned_qty"] = scannedQty,
+            ["remaining_qty"] = targetQty <= 0 ? null : Math.Max(targetQty - scannedQty, 0),
+            ["is_closed"] = string.Equals(pallet["status"]?.ToString(), "CLOSED", StringComparison.OrdinalIgnoreCase),
+            ["items"] = await GetWorkflowPalletItemsAsync(connection, pallet["id"])
+        };
+    }
+
+    private static async Task<Dictionary<string, object?>> BuildShipmentPayloadAsync(NpgsqlConnection connection, Dictionary<string, object?> shipment)
+    {
+        var scannedQty = await ScalarAsync<int>(connection, "SELECT COUNT(*)::int FROM workflow_shipment_items WHERE shipment_id = @shipmentId", ("shipmentId", shipment["id"]));
+        var targetQty = shipment["target_qty"] is null ? 0 : Convert.ToInt32(shipment["target_qty"]);
+        return new Dictionary<string, object?>
+        {
+            ["enabled"] = true,
+            ["id"] = shipment["id"],
+            ["code"] = shipment["shipment_no"],
+            ["target_qty"] = targetQty,
+            ["scanned_qty"] = scannedQty,
+            ["remaining_qty"] = targetQty <= 0 ? null : Math.Max(targetQty - scannedQty, 0),
+            ["is_closed"] = string.Equals(shipment["status"]?.ToString(), "CLOSED", StringComparison.OrdinalIgnoreCase),
+            ["items"] = await GetWorkflowShipmentItemsAsync(connection, shipment["id"])
+        };
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowPalletItemsAsync(NpgsqlConnection connection, object? palletId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              ROW_NUMBER() OVER (ORDER BY pi.added_at ASC, pi.id ASC)::int AS seq,
+              b.id,
+              b.box_no AS code,
+              b.status,
+              (SELECT COUNT(*) FROM workflow_multibox_items mbi WHERE mbi.box_id = b.id)::int AS item_count,
+              pi.added_by,
+              pi.added_at
+            FROM workflow_pallet_items pi
+            JOIN workflow_multiboxes b ON b.id = pi.box_id
+            WHERE pi.pallet_id = @palletId
+            ORDER BY pi.added_at ASC, pi.id ASC
+            """,
+            ("palletId", palletId));
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowShipmentItemsAsync(NpgsqlConnection connection, object? shipmentId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              ROW_NUMBER() OVER (ORDER BY si.added_at ASC, si.id ASC)::int AS seq,
+              p.id,
+              p.pallet_no AS code,
+              p.status,
+              (SELECT COUNT(*) FROM workflow_pallet_items pi WHERE pi.pallet_id = p.id)::int AS item_count,
+              si.added_by,
+              si.added_at
+            FROM workflow_shipment_items si
+            JOIN workflow_pallets p ON p.id = si.pallet_id
+            WHERE si.shipment_id = @shipmentId
+            ORDER BY si.added_at ASC, si.id ASC
+            """,
+            ("shipmentId", shipmentId));
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowPackagingHistoryAsync(NpgsqlConnection connection, string loginId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT *
+            FROM (
+              SELECT
+                b.id,
+                b.box_no AS code,
+                'Multibox' AS type,
+                NULL::integer AS target_qty,
+                (SELECT COUNT(*) FROM workflow_multibox_items mbi WHERE mbi.box_id = b.id)::int AS item_count,
+                b.status,
+                b.created_by,
+                b.created_at,
+                b.closed_at
+              FROM workflow_multiboxes b
+              WHERE b.created_by = @loginId
+
+              UNION ALL
+
+              SELECT
+                p.id,
+                p.pallet_no AS code,
+                'Pallet' AS type,
+                p.target_qty,
+                (SELECT COUNT(*) FROM workflow_pallet_items pi WHERE pi.pallet_id = p.id)::int AS item_count,
+                p.status,
+                p.created_by,
+                p.created_at,
+                p.closed_at
+              FROM workflow_pallets p
+              WHERE p.created_by = @loginId
+
+              UNION ALL
+
+              SELECT
+                s.id,
+                s.shipment_no AS code,
+                'Shipment' AS type,
+                s.target_qty,
+                (SELECT COUNT(*) FROM workflow_shipment_items si WHERE si.shipment_id = s.id)::int AS item_count,
+                s.status,
+                s.created_by,
+                s.created_at,
+                s.closed_at
+              FROM workflow_shipments s
+              WHERE s.created_by = @loginId
+            ) history
+            ORDER BY created_at DESC, id DESC
+            LIMIT 100
+            """,
+            ("loginId", loginId));
+    }
+
     private static async Task<List<Dictionary<string, object?>>> GetRouteRowsForItemAsync(NpgsqlConnection connection, int itemId)
     {
         await EnsureRoutingStepLoginColumnsAsync(connection);
@@ -4874,15 +5391,21 @@ public static class ConvertedEndpoints
         var multiboxRows = await QueryRowsAsync(
             connection,
             """
-            SELECT b.box_no
+            SELECT b.box_no, p.pallet_no, s.shipment_no
             FROM workflow_multibox_items i
             JOIN workflow_multiboxes b ON b.id = i.box_id
+            LEFT JOIN workflow_pallet_items pi ON pi.box_id = b.id
+            LEFT JOIN workflow_pallets p ON p.id = pi.pallet_id
+            LEFT JOIN workflow_shipment_items si ON si.pallet_id = p.id
+            LEFT JOIN workflow_shipments s ON s.id = si.shipment_id
             WHERE i.workflow_serial_id = @serialId
             ORDER BY i.added_at DESC, i.id DESC
             LIMIT 1
             """,
             ("serialId", serial["id"]));
         var multiboxNo = multiboxRows.Count > 0 ? multiboxRows[0]["box_no"] : null;
+        var palletNo = multiboxRows.Count > 0 ? multiboxRows[0]["pallet_no"] : null;
+        var shipmentNo = multiboxRows.Count > 0 ? multiboxRows[0]["shipment_no"] : null;
         var history = await QueryRowsAsync(
             connection,
             """
@@ -4947,7 +5470,9 @@ public static class ConvertedEndpoints
                 created_at = serial["created_at"],
                 updated_at = serial["updated_at"],
                 last_moved_at = serial["last_moved_at"],
-                multibox_no = multiboxNo
+                multibox_no = multiboxNo,
+                pallet_no = palletNo,
+                shipment_no = shipmentNo
             },
             device = new
             {
@@ -6941,6 +7466,64 @@ public static class ConvertedEndpoints
             )
             """);
 
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_pallets (
+              id BIGSERIAL PRIMARY KEY,
+              pallet_no VARCHAR(80) NOT NULL UNIQUE,
+              target_qty INTEGER NOT NULL DEFAULT 0 CHECK (target_qty >= 0),
+              status VARCHAR(20) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+              created_by VARCHAR(100) NOT NULL DEFAULT 'system',
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              closed_at TIMESTAMP
+            )
+            """);
+
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_pallet_items (
+              id BIGSERIAL PRIMARY KEY,
+              pallet_id BIGINT NOT NULL REFERENCES workflow_pallets(id) ON DELETE CASCADE,
+              box_id BIGINT NOT NULL REFERENCES workflow_multiboxes(id) ON DELETE RESTRICT,
+              added_by VARCHAR(100) NOT NULL DEFAULT 'system',
+              added_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_workflow_pallet_box UNIQUE (box_id),
+              CONSTRAINT uq_workflow_pallet_item UNIQUE (pallet_id, box_id)
+            )
+            """);
+
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_shipments (
+              id BIGSERIAL PRIMARY KEY,
+              shipment_no VARCHAR(80) NOT NULL UNIQUE,
+              target_qty INTEGER NOT NULL DEFAULT 0 CHECK (target_qty >= 0),
+              status VARCHAR(20) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+              created_by VARCHAR(100) NOT NULL DEFAULT 'system',
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              closed_at TIMESTAMP
+            )
+            """);
+
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_shipment_items (
+              id BIGSERIAL PRIMARY KEY,
+              shipment_id BIGINT NOT NULL REFERENCES workflow_shipments(id) ON DELETE CASCADE,
+              pallet_id BIGINT NOT NULL REFERENCES workflow_pallets(id) ON DELETE RESTRICT,
+              added_by VARCHAR(100) NOT NULL DEFAULT 'system',
+              added_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_workflow_shipment_pallet UNIQUE (pallet_id),
+              CONSTRAINT uq_workflow_shipment_item UNIQUE (shipment_id, pallet_id)
+            )
+            """);
+
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_work_orders_part ON public.workflow_work_orders (workflow_part_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_route_part ON public.workflow_routing_steps (workflow_part_id, station_order)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_bom_part ON public.workflow_bom_children (workflow_part_id)");
@@ -6953,6 +7536,8 @@ public static class ConvertedEndpoints
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_serial ON public.workflow_serial_station_logs (workflow_serial_id, created_at DESC)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_station ON public.workflow_serial_station_logs (workflow_part_id, station_code)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_multiboxes_open ON public.workflow_multiboxes (workflow_part_id, workflow_work_order_id, status)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_pallets_open ON public.workflow_pallets (created_by, status)");
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_shipments_open ON public.workflow_shipments (created_by, status)");
     }
 
     private static async Task EnsureWorkflowStationLoginsTableAsync(NpgsqlConnection connection)
