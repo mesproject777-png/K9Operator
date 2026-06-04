@@ -37,8 +37,8 @@
       </div>
     </header>
 
-    <div class="label-printer-row" *ngIf="shouldShowLabelPrinterControls && labelPrinterConfig?.isLabelPrintingEnabled">
-      <div class="label-printer-panel">
+    <div class="label-printer-row" *ngIf="shouldShowPrinterControls || shouldShowWeighingControls">
+      <div class="label-printer-panel" *ngIf="shouldShowPrinterControls">
         <label class="label-printer-field" for="operatorPrinterIp">
           <span>Printer IP</span>
           <input
@@ -81,6 +81,16 @@
         >
           {{ labelPrinterMessage }}
         </span>
+      </div>
+
+      <div class="label-printer-panel weighing-panel" *ngIf="shouldShowWeighingControls">
+        <span class="weighing-title">
+          <span class="material-symbols-outlined" aria-hidden="true">scale</span>
+          Weighing
+        </span>
+        <span class="weighing-chip">Min {{ weighingConfig?.minimumWeight || '-' }}</span>
+        <span class="weighing-chip">Max {{ weighingConfig?.maximumWeight || '-' }}</span>
+        <span class="weighing-chip">Tol {{ weighingConfig?.tolerance || '-' }}</span>
       </div>
     </div>
 

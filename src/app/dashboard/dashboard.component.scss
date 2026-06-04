@@ -153,6 +153,7 @@
   display: flex;
   justify-content: flex-end;
   align-items: center;
+  gap: 8px;
   min-height: 44px;
   margin: -14px 18px 18px 0;
 }
@@ -250,6 +251,36 @@
 
 .label-printer-message.error {
   color: #fecaca;
+}
+
+.weighing-panel {
+  min-height: 45px;
+}
+
+.weighing-title,
+.weighing-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  color: #ffffff;
+  font-size: 0.72rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.weighing-title {
+  gap: 4px;
+  text-transform: uppercase;
+}
+
+.weighing-title .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.weighing-chip {
+  padding: 0 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.14);
 }
 
 .station-name {

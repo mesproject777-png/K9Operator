@@ -431,6 +431,48 @@ public static class ConvertedEndpoints
             return Results.Json(BuildOperatorLabelPrintingResponse(config, station));
         });
 
+        app.MapGet("/api/operator/weighing-config", async (HttpRequest request) =>
+        {
+            var loginId = request.Query["loginId"].ToString().Trim();
+            var stationCodeFilter = request.Query["stationCode"].ToString().Trim();
+            var workflowPartIdFilter = int.TryParse(request.Query["workflowPartId"].ToString(), out var parsedWorkflowPartId)
+                ? parsedWorkflowPartId
+                : (int?)null;
+            if (string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonError("loginId is required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter, stationCodeFilter);
+            if (station is null)
+            {
+                return JsonError("Invalid station login ID", 404);
+            }
+
+            var config = await GetWorkflowStationWeighingConfigAsync(
+                connection,
+                Convert.ToInt32(station["workflow_part_id"]),
+                station["station_code"]?.ToString());
+
+            if (config is null || config["isWeighingEnabled"] is not bool enabled || !enabled)
+            {
+                return Results.Json(new { isWeighingEnabled = false });
+            }
+
+            return Results.Json(new
+            {
+                isWeighingEnabled = true,
+                stationCode = station["station_code"],
+                stationName = station["station_name"],
+                workflowPartId = station["workflow_part_id"],
+                minimumWeight = config["minimumWeight"],
+                maximumWeight = config["maximumWeight"],
+                tolerance = config["tolerance"]
+            });
+        });
+
         app.MapPut("/api/operator/label-printing-config", async (HttpContext context) =>
         {
             var payload = await ReadJsonBodyAsync(context.Request);
@@ -4905,8 +4947,8 @@ public static class ConvertedEndpoints
                 FROM workflow_station_logins l
                 JOIN workflow_routing_steps r ON r.id = l.workflow_routing_step_id
                 WHERE UPPER(l.station_login_id) = UPPER(@loginId)
-                  AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
-                  AND (@stationCode = '' OR UPPER(r.station_code) = UPPER(@stationCode))
+                  AND (@workflowPartId::integer IS NULL OR r.workflow_part_id = @workflowPartId::integer)
+                  AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))
 
                 UNION ALL
 
@@ -4923,8 +4965,8 @@ public static class ConvertedEndpoints
                 JOIN items i ON i.id = r.item_id
                 LEFT JOIN workflow_part_numbers p ON UPPER(p.pn) = UPPER(i.pn)
                 WHERE UPPER(r.station_login_id) = UPPER(@loginId)
-                  AND (@workflowPartId IS NULL OR p.id = @workflowPartId)
-                  AND (@stationCode = '' OR UPPER(r.station_code) = UPPER(@stationCode))
+                  AND (@workflowPartId::integer IS NULL OR p.id = @workflowPartId::integer)
+                  AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))
 
                 UNION ALL
 
@@ -4939,8 +4981,8 @@ public static class ConvertedEndpoints
                   2 AS source_priority
                 FROM workflow_routing_steps r
                 WHERE UPPER(r.station_login_id) = UPPER(@loginId)
-                  AND (@workflowPartId IS NULL OR r.workflow_part_id = @workflowPartId)
-                  AND (@stationCode = '' OR UPPER(r.station_code) = UPPER(@stationCode))
+                  AND (@workflowPartId::integer IS NULL OR r.workflow_part_id = @workflowPartId::integer)
+                  AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))
             ) station
             ORDER BY station.source_priority ASC, station.updated_at DESC, station.id DESC
             LIMIT 1
@@ -5950,6 +5992,43 @@ public static class ConvertedEndpoints
                 }
             }
 
+            if (payload["stationWeighing"] is JsonObject stationWeighing)
+            {
+                await ExecuteAsync(connection, "DELETE FROM workflow_station_weighing WHERE workflow_part_id = @workflowPartId", ("workflowPartId", workflowPartId));
+                foreach (var configGroup in stationWeighing)
+                {
+                    var stationCode = configGroup.Key.Trim();
+                    if (string.IsNullOrWhiteSpace(stationCode) || configGroup.Value is null) continue;
+
+                    await ExecuteAsync(
+                        connection,
+                        """
+                        INSERT INTO workflow_station_weighing
+                          (workflow_part_id, station_code, station_id, station_name, minimum_weight,
+                           maximum_weight, tolerance, is_weighing_enabled)
+                        VALUES
+                          (@workflowPartId, @stationCode, @stationId, @stationName, @minimumWeight,
+                           @maximumWeight, @tolerance, @isWeighingEnabled)
+                        ON CONFLICT (workflow_part_id, station_code) DO UPDATE
+                        SET station_id = EXCLUDED.station_id,
+                            station_name = EXCLUDED.station_name,
+                            minimum_weight = EXCLUDED.minimum_weight,
+                            maximum_weight = EXCLUDED.maximum_weight,
+                            tolerance = EXCLUDED.tolerance,
+                            is_weighing_enabled = EXCLUDED.is_weighing_enabled,
+                            updated_at = NOW()
+                        """,
+                        ("workflowPartId", workflowPartId),
+                        ("stationCode", stationCode),
+                        ("stationId", ToDbNullable(ReadInt(configGroup.Value, "stationId"))),
+                        ("stationName", ToDbNullable(ReadString(configGroup.Value, "stationName")?.Trim())),
+                        ("minimumWeight", ToDbNullable(ReadString(configGroup.Value, "minimumWeight")?.Trim())),
+                        ("maximumWeight", ToDbNullable(ReadString(configGroup.Value, "maximumWeight")?.Trim())),
+                        ("tolerance", ToDbNullable(ReadString(configGroup.Value, "tolerance")?.Trim())),
+                        ("isWeighingEnabled", ReadBool(configGroup.Value, "isWeighingEnabled") ?? false));
+                }
+            }
+
             if (payload["previewStatuses"] is JsonObject previewStatuses)
             {
                 await ExecuteAsync(connection, "DELETE FROM workflow_preview_station_statuses WHERE workflow_part_id = @workflowPartId", ("workflowPartId", workflowPartId));
@@ -6552,6 +6631,7 @@ public static class ConvertedEndpoints
                 ("workflowPartId", workflowPartId));
 
             var labelPrintingRows = await GetWorkflowStationLabelPrintingRowsAsync(connection, workflowPartId);
+            var weighingRows = await GetWorkflowStationWeighingRowsAsync(connection, workflowPartId);
 
             var statusRows = await QueryRowsAsync(
                 connection,
@@ -6578,6 +6658,7 @@ public static class ConvertedEndpoints
                 bom = bomRows,
                 stationRules = GroupWorkflowRules(ruleRows),
                 stationLabelPrinting = GroupWorkflowStationLabelPrinting(labelPrintingRows),
+                stationWeighing = GroupWorkflowStationWeighing(weighingRows),
                 previewStatuses = statusRows.ToDictionary(
                     row => Convert.ToString(row["station_code"]) ?? string.Empty,
                     row => Convert.ToString(row["status"]) ?? string.Empty)
@@ -6685,6 +6766,7 @@ public static class ConvertedEndpoints
             bom = existingBomRows,
             stationRules = new Dictionary<string, List<string>>(),
             stationLabelPrinting = new Dictionary<string, object>(),
+            stationWeighing = new Dictionary<string, object>(),
             previewStatuses = new Dictionary<string, string>()
         };
     }
@@ -6763,6 +6845,85 @@ public static class ConvertedEndpoints
             ["status"] = Convert.ToString(row["status"]) ?? string.Empty,
             ["isLabelPrintingEnabled"] = row["is_label_printing_enabled"] is bool enabled && enabled
         };
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowStationWeighingRowsAsync(NpgsqlConnection connection, int workflowPartId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              w.station_code,
+              COALESCE(w.station_id, r.id) AS station_id,
+              COALESCE(NULLIF(w.station_name, ''), r.station_name, '') AS station_name,
+              COALESCE(w.minimum_weight::text, '') AS minimum_weight,
+              COALESCE(w.maximum_weight::text, '') AS maximum_weight,
+              COALESCE(w.tolerance::text, '') AS tolerance,
+              COALESCE(w.is_weighing_enabled, FALSE) AS is_weighing_enabled
+            FROM workflow_station_weighing w
+            LEFT JOIN workflow_routing_steps r
+              ON r.workflow_part_id = w.workflow_part_id
+             AND r.station_code = w.station_code
+            WHERE w.workflow_part_id = @workflowPartId
+            ORDER BY w.station_code ASC
+            """,
+            ("workflowPartId", workflowPartId));
+    }
+
+    private static Dictionary<string, object> GroupWorkflowStationWeighing(List<Dictionary<string, object?>> rows)
+    {
+        return rows.ToDictionary(
+            row => Convert.ToString(row["station_code"]) ?? string.Empty,
+            row => (object)BuildWorkflowStationWeighingConfig(row),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, object?> BuildWorkflowStationWeighingConfig(Dictionary<string, object?> row)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["stationId"] = row["station_id"] is null || row["station_id"] is DBNull ? null : Convert.ToInt32(row["station_id"]),
+            ["stationName"] = Convert.ToString(row["station_name"]) ?? string.Empty,
+            ["minimumWeight"] = Convert.ToString(row["minimum_weight"]) ?? string.Empty,
+            ["maximumWeight"] = Convert.ToString(row["maximum_weight"]) ?? string.Empty,
+            ["tolerance"] = Convert.ToString(row["tolerance"]) ?? string.Empty,
+            ["isWeighingEnabled"] = row["is_weighing_enabled"] is bool enabled && enabled
+        };
+    }
+
+    private static async Task<Dictionary<string, object?>?> GetWorkflowStationWeighingConfigAsync(
+        NpgsqlConnection connection,
+        int workflowPartId,
+        string? stationCode)
+    {
+        if (string.IsNullOrWhiteSpace(stationCode))
+        {
+            return null;
+        }
+
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              w.station_code,
+              COALESCE(w.station_id, r.id) AS station_id,
+              COALESCE(NULLIF(w.station_name, ''), r.station_name, '') AS station_name,
+              COALESCE(w.minimum_weight::text, '') AS minimum_weight,
+              COALESCE(w.maximum_weight::text, '') AS maximum_weight,
+              COALESCE(w.tolerance::text, '') AS tolerance,
+              COALESCE(w.is_weighing_enabled, FALSE) AS is_weighing_enabled
+            FROM workflow_station_weighing w
+            LEFT JOIN workflow_routing_steps r
+              ON r.workflow_part_id = w.workflow_part_id
+             AND r.station_code = w.station_code
+            WHERE w.workflow_part_id = @workflowPartId
+              AND UPPER(w.station_code) = UPPER(@stationCode)
+            LIMIT 1
+            """,
+            ("workflowPartId", workflowPartId),
+            ("stationCode", stationCode.Trim()));
+
+        return rows.Count > 0 ? BuildWorkflowStationWeighingConfig(rows[0]) : null;
     }
 
     private static async Task<Dictionary<string, object?>?> GetWorkflowStationLabelPrintingConfigAsync(
@@ -7424,6 +7585,28 @@ public static class ConvertedEndpoints
 
         await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_label_printing ADD COLUMN IF NOT EXISTS station_id INTEGER");
         await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_label_printing ADD COLUMN IF NOT EXISTS is_label_printing_enabled BOOLEAN NOT NULL DEFAULT FALSE");
+
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_station_weighing (
+              id SERIAL PRIMARY KEY,
+              workflow_part_id INTEGER NOT NULL REFERENCES workflow_part_numbers(id) ON DELETE CASCADE,
+              station_code VARCHAR(80) NOT NULL,
+              station_id INTEGER,
+              station_name VARCHAR(220),
+              minimum_weight VARCHAR(80),
+              maximum_weight VARCHAR(80),
+              tolerance VARCHAR(80),
+              is_weighing_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_workflow_station_weighing UNIQUE (workflow_part_id, station_code)
+            )
+            """);
+
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_weighing ADD COLUMN IF NOT EXISTS station_id INTEGER");
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_weighing ADD COLUMN IF NOT EXISTS is_weighing_enabled BOOLEAN NOT NULL DEFAULT FALSE");
 
         await ExecuteAsync(connection, "CREATE SEQUENCE IF NOT EXISTS public.workflow_rsn_seq START WITH 1");
         await ExecuteAsync(

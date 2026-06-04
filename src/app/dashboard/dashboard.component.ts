@@ -21,6 +21,16 @@ type OperatorLabelPrinterConfig = {
   success?: boolean;
 };
 
+type OperatorWeighingConfig = {
+  isWeighingEnabled: boolean;
+  stationCode?: string;
+  stationName?: string;
+  workflowPartId?: number;
+  minimumWeight?: string;
+  maximumWeight?: string;
+  tolerance?: string;
+};
+
 @Component({
   selector: 'app-dashboard',
   standalone: false,
@@ -32,6 +42,7 @@ export class DashboardComponent implements OnDestroy {
   isProfileMenuOpen = false;
   headerSearch = '';
   labelPrinterConfig: OperatorLabelPrinterConfig | null = null;
+  weighingConfig: OperatorWeighingConfig | null = null;
   labelPrinterIp = '';
   labelPrinterMessage = '';
   labelPrinterMessageType: 'success' | 'error' | 'info' = 'info';
@@ -51,14 +62,17 @@ export class DashboardComponent implements OnDestroy {
   ) {
     this.currentUser = this.authService.getCurrentUser();
     this.loadLabelPrinterConfig();
+    this.loadWeighingConfig();
     this.startLabelPrinterRefresh();
 
     this.authSub = this.authService.currentUser$.subscribe((user) => {
       this.currentUser = user;
       this.labelPrinterConfig = null;
+      this.weighingConfig = null;
       this.labelPrinterIp = '';
       this.labelPrinterMessage = '';
       this.loadLabelPrinterConfig();
+      this.loadWeighingConfig();
       this.startLabelPrinterRefresh();
     });
   }
@@ -111,7 +125,18 @@ export class DashboardComponent implements OnDestroy {
   get shouldShowLabelPrinterControls(): boolean {
     const currentUrl = this.router.parseUrl(this.router.url);
     const path = currentUrl.root.children['primary']?.segments.map((segment) => segment.path).join('/') || '';
-    return path === 'dashboard/operator' && !currentUrl.queryParams['q'];
+    return path === 'dashboard/operator';
+  }
+
+  get shouldShowWeighingControls(): boolean {
+    return this.shouldShowLabelPrinterControls &&
+      Boolean(this.weighingConfig?.isWeighingEnabled) &&
+      !this.shouldShowPrinterControls;
+  }
+
+  get shouldShowPrinterControls(): boolean {
+    return this.shouldShowLabelPrinterControls &&
+      Boolean(this.labelPrinterConfig?.isLabelPrintingEnabled);
   }
 
   loadLabelPrinterConfig(silent = false): void {
@@ -127,7 +152,7 @@ export class DashboardComponent implements OnDestroy {
       this.isLabelPrinterLoading = true;
     }
 
-    const params = this.buildLabelPrinterParams(loginId);
+    const params = this.buildOperatorStationParams(loginId);
     this.http.get<OperatorLabelPrinterConfig>(`${this.operatorApiUrl}/label-printing-config`, { params }).subscribe({
       next: (config) => {
         this.isLabelPrinterLoading = false;
@@ -148,6 +173,24 @@ export class DashboardComponent implements OnDestroy {
           this.labelPrinterConfig = null;
           this.labelPrinterIp = '';
         }
+      },
+    });
+  }
+
+  loadWeighingConfig(): void {
+    const loginId = this.currentUser?.login_id;
+    if (!loginId) {
+      this.weighingConfig = null;
+      return;
+    }
+
+    const params = this.buildOperatorStationParams(loginId);
+    this.http.get<OperatorWeighingConfig>(`${this.operatorApiUrl}/weighing-config`, { params }).subscribe({
+      next: (config) => {
+        this.weighingConfig = config?.isWeighingEnabled ? config : null;
+      },
+      error: () => {
+        this.weighingConfig = null;
       },
     });
   }
@@ -259,7 +302,7 @@ export class DashboardComponent implements OnDestroy {
     this.labelPrinterMessageType = type;
   }
 
-  private buildLabelPrinterParams(loginId: string): HttpParams {
+  private buildOperatorStationParams(loginId: string): HttpParams {
     let params = new HttpParams().set('loginId', loginId);
     if (this.currentUser?.workflow_part_id) {
       params = params.set('workflowPartId', String(this.currentUser.workflow_part_id));
@@ -277,7 +320,10 @@ export class DashboardComponent implements OnDestroy {
       return;
     }
 
-    this.labelPrinterRefreshId = setInterval(() => this.loadLabelPrinterConfig(true), 15000);
+    this.labelPrinterRefreshId = setInterval(() => {
+      this.loadLabelPrinterConfig(true);
+      this.loadWeighingConfig();
+    }, 15000);
   }
 
   private stopLabelPrinterRefresh(): void {
