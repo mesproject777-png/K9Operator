@@ -476,11 +476,23 @@
 .multibox-scan-row {
   display: flex;
   align-items: flex-end;
-  gap: 14px;
+  gap: 18px;
+  flex-wrap: wrap;
 }
 
 .qty-entry {
-  width: 160px;
+  flex: 0 0 170px;
+  width: 170px;
+}
+
+.multibox-scan-row .serial-entry:not(.qty-entry) {
+  flex: 0 1 560px;
+  min-width: 320px;
+}
+
+.multibox-scan-row .serial-entry input {
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .inline-message {

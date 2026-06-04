@@ -786,6 +786,9 @@ public static class ConvertedEndpoints
         app.MapGet("/api/operator/multibox/status", async (HttpRequest request) =>
         {
             var loginId = request.Query["loginId"].ToString().Trim();
+            var workflowPartIdFilter = int.TryParse(request.Query["workflowPartId"].ToString(), out var parsedWorkflowPartId)
+                ? parsedWorkflowPartId
+                : (int?)null;
             if (string.IsNullOrWhiteSpace(loginId))
             {
                 return JsonMessage("Login ID is required", 400);
@@ -793,7 +796,7 @@ public static class ConvertedEndpoints
 
             await using var connection = await OpenConnectionAsync();
             await EnsureWorkflowSchemaAsync(connection);
-            var station = await GetOperatorStationAsync(connection, loginId);
+            var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter);
             if (station is null)
             {
                 return JsonMessage("Invalid station login ID", 401);
@@ -830,6 +833,7 @@ public static class ConvertedEndpoints
             var payload = await ReadJsonBodyAsync(context.Request);
             var loginId = ReadString(payload, "loginId")?.Trim();
             var query = ReadString(payload, "query")?.Trim();
+            var workflowPartIdFilter = ReadInt(payload, "workflowPartId");
             if (string.IsNullOrWhiteSpace(loginId) || string.IsNullOrWhiteSpace(query))
             {
                 return JsonMessage("Login ID and serial number are required", 400);
@@ -841,7 +845,7 @@ public static class ConvertedEndpoints
             await using var transaction = await connection.BeginTransactionAsync();
             try
             {
-                var station = await GetOperatorStationAsync(connection, loginId);
+                var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter);
                 if (station is null)
                 {
                     await transaction.RollbackAsync();
@@ -1004,6 +1008,9 @@ public static class ConvertedEndpoints
         app.MapGet("/api/operator/pallet/status", async (HttpRequest request) =>
         {
             var loginId = request.Query["loginId"].ToString().Trim();
+            var workflowPartIdFilter = int.TryParse(request.Query["workflowPartId"].ToString(), out var parsedWorkflowPartId)
+                ? parsedWorkflowPartId
+                : (int?)null;
             if (string.IsNullOrWhiteSpace(loginId))
             {
                 return JsonMessage("Login ID is required", 400);
@@ -1011,7 +1018,7 @@ public static class ConvertedEndpoints
 
             await using var connection = await OpenConnectionAsync();
             await EnsureWorkflowSchemaAsync(connection);
-            var station = await GetOperatorStationAsync(connection, loginId);
+            var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter);
             if (station is null)
             {
                 return JsonMessage("Invalid station login ID", 401);
@@ -1032,6 +1039,7 @@ public static class ConvertedEndpoints
             var loginId = ReadString(payload, "loginId")?.Trim();
             var query = ReadString(payload, "query")?.Trim();
             var targetQty = ReadInt(payload, "targetQty");
+            var workflowPartIdFilter = ReadInt(payload, "workflowPartId");
             if (string.IsNullOrWhiteSpace(loginId) || string.IsNullOrWhiteSpace(query))
             {
                 return JsonMessage("Login ID and multibox number are required", 400);
@@ -1047,7 +1055,7 @@ public static class ConvertedEndpoints
             await using var transaction = await connection.BeginTransactionAsync();
             try
             {
-                var station = await GetOperatorStationAsync(connection, loginId);
+                var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter);
                 if (station is null)
                 {
                     await transaction.RollbackAsync();
@@ -1134,6 +1142,9 @@ public static class ConvertedEndpoints
         app.MapGet("/api/operator/shipment/status", async (HttpRequest request) =>
         {
             var loginId = request.Query["loginId"].ToString().Trim();
+            var workflowPartIdFilter = int.TryParse(request.Query["workflowPartId"].ToString(), out var parsedWorkflowPartId)
+                ? parsedWorkflowPartId
+                : (int?)null;
             if (string.IsNullOrWhiteSpace(loginId))
             {
                 return JsonMessage("Login ID is required", 400);
@@ -1141,7 +1152,7 @@ public static class ConvertedEndpoints
 
             await using var connection = await OpenConnectionAsync();
             await EnsureWorkflowSchemaAsync(connection);
-            var station = await GetOperatorStationAsync(connection, loginId);
+            var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter);
             if (station is null)
             {
                 return JsonMessage("Invalid station login ID", 401);
@@ -1162,6 +1173,7 @@ public static class ConvertedEndpoints
             var loginId = ReadString(payload, "loginId")?.Trim();
             var query = ReadString(payload, "query")?.Trim();
             var targetQty = ReadInt(payload, "targetQty");
+            var workflowPartIdFilter = ReadInt(payload, "workflowPartId");
             if (string.IsNullOrWhiteSpace(loginId) || string.IsNullOrWhiteSpace(query))
             {
                 return JsonMessage("Login ID and pallet number are required", 400);
@@ -1177,7 +1189,7 @@ public static class ConvertedEndpoints
             await using var transaction = await connection.BeginTransactionAsync();
             try
             {
-                var station = await GetOperatorStationAsync(connection, loginId);
+                var station = await GetOperatorStationByLoginAsync(connection, loginId, workflowPartIdFilter);
                 if (station is null)
                 {
                     await transaction.RollbackAsync();
@@ -4933,7 +4945,9 @@ public static class ConvertedEndpoints
               station.station_name,
               station.station_order,
               station.workflow_part_id,
-              station.station_login_id
+              station.station_login_id,
+              station.box_qty,
+              station.workflow_work_order_id
             FROM (
                 SELECT
                   r.station_code,
@@ -4941,11 +4955,22 @@ public static class ConvertedEndpoints
                   r.station_order,
                   r.workflow_part_id,
                   l.station_login_id,
+                  p.box_qty,
+                  COALESCE(w.id, latest_w.id) AS workflow_work_order_id,
                   l.updated_at,
                   l.id,
                   0 AS source_priority
                 FROM workflow_station_logins l
                 JOIN workflow_routing_steps r ON r.id = l.workflow_routing_step_id
+                JOIN workflow_part_numbers p ON p.id = r.workflow_part_id
+                LEFT JOIN workflow_work_orders w ON w.id = l.workflow_work_order_id
+                LEFT JOIN LATERAL (
+                    SELECT ww.id
+                    FROM workflow_work_orders ww
+                    WHERE ww.workflow_part_id = p.id
+                    ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                    LIMIT 1
+                ) latest_w ON TRUE
                 WHERE UPPER(l.station_login_id) = UPPER(@loginId)
                   AND (@workflowPartId::integer IS NULL OR r.workflow_part_id = @workflowPartId::integer)
                   AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))
@@ -4958,12 +4983,21 @@ public static class ConvertedEndpoints
                   r.station_order,
                   p.id AS workflow_part_id,
                   r.station_login_id,
+                  p.box_qty,
+                  w.id AS workflow_work_order_id,
                   r.updated_at,
                   r.id,
                   1 AS source_priority
                 FROM item_routing_steps r
                 JOIN items i ON i.id = r.item_id
                 LEFT JOIN workflow_part_numbers p ON UPPER(p.pn) = UPPER(i.pn)
+                LEFT JOIN LATERAL (
+                    SELECT ww.id
+                    FROM workflow_work_orders ww
+                    WHERE ww.workflow_part_id = p.id
+                    ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                    LIMIT 1
+                ) w ON TRUE
                 WHERE UPPER(r.station_login_id) = UPPER(@loginId)
                   AND (@workflowPartId::integer IS NULL OR p.id = @workflowPartId::integer)
                   AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))
@@ -4976,10 +5010,20 @@ public static class ConvertedEndpoints
                   r.station_order,
                   r.workflow_part_id,
                   r.station_login_id,
+                  p.box_qty,
+                  w.id AS workflow_work_order_id,
                   r.updated_at,
                   r.id,
                   2 AS source_priority
                 FROM workflow_routing_steps r
+                JOIN workflow_part_numbers p ON p.id = r.workflow_part_id
+                LEFT JOIN LATERAL (
+                    SELECT ww.id
+                    FROM workflow_work_orders ww
+                    WHERE ww.workflow_part_id = p.id
+                    ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                    LIMIT 1
+                ) w ON TRUE
                 WHERE UPPER(r.station_login_id) = UPPER(@loginId)
                   AND (@workflowPartId::integer IS NULL OR r.workflow_part_id = @workflowPartId::integer)
                   AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))

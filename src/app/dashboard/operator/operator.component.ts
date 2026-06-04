@@ -364,8 +364,13 @@ export class OperatorComponent implements OnDestroy {
     const endpoint = this.activePackagingMode === 'multibox'
       ? `${this.apiUrl}/multibox/status`
       : `${this.apiUrl}/${this.activePackagingMode}/status`;
+    let params = new HttpParams().set('loginId', this.currentUser.login_id);
+    if (this.currentUser.workflow_part_id) {
+      params = params.set('workflowPartId', String(this.currentUser.workflow_part_id));
+    }
+
     this.http.get<any>(endpoint, {
-      params: { loginId: this.currentUser.login_id }
+      params
     }).subscribe({
       next: (status) => {
         this.multiboxStatus = this.normalizePackagingStatus(status);
@@ -414,7 +419,8 @@ export class OperatorComponent implements OnDestroy {
       : `${this.apiUrl}/${this.activePackagingMode}/scan`;
     const body: Record<string, unknown> = {
       loginId: this.currentUser.login_id,
-      query
+      query,
+      workflowPartId: this.currentUser.workflow_part_id
     };
     if (this.activePackagingMode !== 'multibox') {
       body['targetQty'] = this.packagingTargetQty;
