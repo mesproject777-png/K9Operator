@@ -1366,6 +1366,67 @@ public static class ConvertedEndpoints
                     return JsonMessage($"Previous station \"{stationName}\" is not passed", 409);
                 }
 
+                var samplingDecision = await ResolveSamplingDecisionAsync(connection, workflowPartId, selected, serial);
+                if (samplingDecision.IsEnabled && !samplingDecision.IsRequired)
+                {
+                    var nextStepForSampling = routeRows.FirstOrDefault(step => Convert.ToInt32(step["station_order"]) > selectedOrder);
+                    var nextStatusForSampling = nextStepForSampling is null ? "Completed" : "In Process";
+                    var nextStationCodeForSampling = nextStepForSampling?["station_code"] ?? selected["station_code"];
+                    var nextStationOrderForSampling = nextStepForSampling?["station_order"] ?? selected["station_order"];
+                    var samplingRemark = $"Sampling skipped - auto passed ({samplingDecision.Reason})";
+
+                    await ExecuteAsync(
+                        connection,
+                        """
+                        UPDATE workflow_serial_numbers
+                        SET status = @status,
+                            condition = 'Good',
+                            current_station_code = @stationCode,
+                            current_station_order = @stationOrder,
+                            last_moved_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = @id
+                        """,
+                        ("status", nextStatusForSampling),
+                        ("stationCode", nextStationCodeForSampling),
+                        ("stationOrder", nextStationOrderForSampling),
+                        ("id", serial["id"]));
+
+                    await InsertWorkflowStationLogAsync(
+                        connection,
+                        serial,
+                        selected,
+                        "PASS",
+                        samplingRemark,
+                        loginId,
+                        serial["current_station_code"],
+                        serial["current_station_order"],
+                        nextStationCodeForSampling,
+                        nextStationOrderForSampling);
+
+                    await MirrorWorkflowPassToLegacyTraceAsync(
+                        connection,
+                        serial,
+                        selected,
+                        "PASS",
+                        samplingRemark,
+                        loginId,
+                        serial["current_station_code"],
+                        serial["current_station_order"],
+                        nextStationCodeForSampling,
+                        nextStationOrderForSampling,
+                        nextStatusForSampling);
+
+                    await transaction.CommitAsync();
+                    return Results.Json(new
+                    {
+                        message = "SN not selected for sampling. Station auto-passed.",
+                        station_code = selected["station_code"],
+                        status = "Sampling Skipped",
+                        sampling = samplingDecision
+                    });
+                }
+
                 var bomStatus = await BuildWorkflowBomBindingStatusAsync(connection, serial, selected);
                 if (bomStatus.RequiresBinding && bomStatus.Remaining > 0)
                 {
@@ -4486,7 +4547,7 @@ public static class ConvertedEndpoints
         var rows = await QueryRowsAsync(
             connection,
             """
-            SELECT snr.id, snr.sn, snr.rsn, snr.status AS serial_status, snr.condition,
+            SELECT snr.id, snr.sn, snr.rsn, snr.generated_index, snr.status AS serial_status, snr.condition,
                    snr.current_station_code, snr.current_station_order, snr.last_moved_at,
                    snr.created_at, snr.updated_at,
                    wo.id AS work_order_id, wo.wo, wo.status AS wo_status, wo.qty AS wo_qty, wo.balance AS wo_balance,
@@ -4880,6 +4941,16 @@ public static class ConvertedEndpoints
         int Remaining,
         bool RequiresBinding);
 
+    private sealed record SamplingDecision(
+        bool IsEnabled,
+        bool IsRequired,
+        string SamplingType,
+        string Reason,
+        int GeneratedIndex,
+        int IntervalQty,
+        int SampleQty,
+        int LotSize);
+
     private static async Task<(OperatorWorkflowContext? Context, IResult? Error)> ResolveOperatorWorkflowContextAsync(
         NpgsqlConnection connection,
         string query,
@@ -5193,6 +5264,89 @@ public static class ConvertedEndpoints
     {
         var text = $"{stationCode} {stationName}";
         return text.Contains("PACK", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<SamplingDecision> ResolveSamplingDecisionAsync(
+        NpgsqlConnection connection,
+        int workflowPartId,
+        Dictionary<string, object?> station,
+        Dictionary<string, object?> serial)
+    {
+        if (!string.Equals(station["sample_mode"]?.ToString(), "Sample", StringComparison.OrdinalIgnoreCase))
+        {
+            return new SamplingDecision(false, true, "FULL", "Full station", 0, 0, 0, 0);
+        }
+
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT sampling_type, interval_qty, sample_qty, lot_size, is_sampling_enabled
+            FROM workflow_station_sampling
+            WHERE workflow_part_id = @workflowPartId
+              AND UPPER(station_code) = UPPER(@stationCode)
+            LIMIT 1
+            """,
+            ("workflowPartId", workflowPartId),
+            ("stationCode", station["station_code"]));
+
+        if (rows.Count == 0 || rows[0]["is_sampling_enabled"] is not bool enabled || !enabled)
+        {
+            return new SamplingDecision(false, true, "DISABLED", "Sampling disabled", 0, 0, 0, 0);
+        }
+
+        var generatedIndex = Math.Max(1, Convert.ToInt32(serial["generated_index"] ?? 1));
+        var samplingType = (rows[0]["sampling_type"]?.ToString() ?? "PERIODIC").Trim().ToUpperInvariant();
+        var intervalQty = Math.Max(1, Convert.ToInt32(rows[0]["interval_qty"] ?? 10));
+        var sampleQty = Math.Max(1, Convert.ToInt32(rows[0]["sample_qty"] ?? 1));
+        var lotSize = Math.Max(1, Convert.ToInt32(rows[0]["lot_size"] ?? 1000));
+        var isRequired = samplingType switch
+        {
+            "FIRST_PIECE" => generatedIndex == 1,
+            "LOT" => ((generatedIndex - 1) % lotSize) < Math.Min(sampleQty, lotSize),
+            "RANDOM" => IsRandomSampleSelected(
+                generatedIndex,
+                intervalQty,
+                sampleQty,
+                $"{workflowPartId}:{station["station_code"]}"),
+            _ => ((generatedIndex - 1) % intervalQty) < Math.Min(sampleQty, intervalQty)
+        };
+        var reason = isRequired
+            ? $"{samplingType} selected SN index {generatedIndex}"
+            : $"{samplingType} did not select SN index {generatedIndex}";
+
+        return new SamplingDecision(true, isRequired, samplingType, reason, generatedIndex, intervalQty, sampleQty, lotSize);
+    }
+
+    private static bool IsRandomSampleSelected(int generatedIndex, int intervalQty, int sampleQty, string seedPrefix)
+    {
+        intervalQty = Math.Max(1, intervalQty);
+        sampleQty = Math.Clamp(sampleQty, 1, intervalQty);
+
+        var zeroBasedIndex = Math.Max(0, generatedIndex - 1);
+        var groupIndex = zeroBasedIndex / intervalQty;
+        var positionInGroup = zeroBasedIndex % intervalQty;
+        var selectedPositions = Enumerable
+            .Range(0, intervalQty)
+            .OrderBy(position => StableSamplingHash($"{seedPrefix}:{groupIndex}:{position}"))
+            .Take(sampleQty)
+            .ToHashSet();
+
+        return selectedPositions.Contains(positionInGroup);
+    }
+
+    private static ulong StableSamplingHash(string value)
+    {
+        const ulong offset = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        var hash = offset;
+
+        foreach (var character in value)
+        {
+            hash ^= character;
+            hash *= prime;
+        }
+
+        return hash;
     }
 
     private static async Task InsertWorkflowStationLogAsync(
@@ -7651,6 +7805,29 @@ public static class ConvertedEndpoints
 
         await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_weighing ADD COLUMN IF NOT EXISTS station_id INTEGER");
         await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_weighing ADD COLUMN IF NOT EXISTS is_weighing_enabled BOOLEAN NOT NULL DEFAULT FALSE");
+
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_station_sampling (
+              id SERIAL PRIMARY KEY,
+              workflow_part_id INTEGER NOT NULL REFERENCES workflow_part_numbers(id) ON DELETE CASCADE,
+              station_code VARCHAR(80) NOT NULL,
+              station_id INTEGER,
+              station_name VARCHAR(220),
+              sampling_type VARCHAR(30) NOT NULL DEFAULT 'PERIODIC',
+              interval_qty INTEGER NOT NULL DEFAULT 10,
+              sample_qty INTEGER NOT NULL DEFAULT 1,
+              lot_size INTEGER NOT NULL DEFAULT 1000,
+              is_sampling_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_workflow_station_sampling UNIQUE (workflow_part_id, station_code)
+            )
+            """);
+
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_sampling ADD COLUMN IF NOT EXISTS station_id INTEGER");
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_sampling ADD COLUMN IF NOT EXISTS is_sampling_enabled BOOLEAN NOT NULL DEFAULT FALSE");
 
         await ExecuteAsync(connection, "CREATE SEQUENCE IF NOT EXISTS public.workflow_rsn_seq START WITH 1");
         await ExecuteAsync(
