@@ -20,6 +20,7 @@ import {
   TraceAssembledPart,
   TraceHistoryRow,
   TraceSearchResponse,
+  TraceSnValue,
 } from '../../services/traceability.service';
 
 type StationLabelPrintingConfig = {
@@ -138,6 +139,17 @@ type SnHistoryDisplayRow = {
   parentRevision?: string;
 };
 
+type SnValueDisplayRow = {
+  key: string;
+  value: string;
+};
+
+type SnValueDisplayGroup = {
+  stationCode: string;
+  stationName: string;
+  values: SnValueDisplayRow[];
+};
+
 @Component({
   selector: 'app-sn-result',
   standalone: false,
@@ -165,6 +177,7 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
   previewFlowCardsPerRow = this.getPreviewFlowCardsPerRow();
   isChildDetailsOpen = false;
   isAssembledPartsOpen = false;
+  isSnValuesOpen = false;
   activePreviewStation: PreviewStationNode | null = null;
   activePreviewLogistics: PreviewFlowNode | null = null;
   previewStationStatusById: Record<number, PreviewStatus> = {};
@@ -307,14 +320,6 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
       : partNumber;
   }
 
-  get boxLeftLabel(): string {
-    return this.workflowSnapshot?.workOrder?.lot || this.serialNumber;
-  }
-
-  get boxRightLabel(): string {
-    return 'Assembled parts';
-  }
-
   get assembledParts(): TraceAssembledPart[] {
     return this.traceResult?.assembled_parts || [];
   }
@@ -448,6 +453,73 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
 
   get isSerialShipped(): boolean {
     return Boolean(this.traceShipmentNo);
+  }
+
+  get snValueGroups(): SnValueDisplayGroup[] {
+    return (this.traceResult?.sn_values || [])
+      .map((row) => ({
+        stationCode: String(row.station_code || '-').trim() || '-',
+        stationName: String(row.station_name || '').trim(),
+        values: this.buildSnValueRows(row),
+      }))
+      .filter((group) => group.values.length > 0);
+  }
+
+  get snValuesSummary(): string {
+    const count = this.snValueGroups.reduce((total, group) => total + group.values.length, 0);
+    return count === 1 ? '1 Connected Value' : `${count} Connected Values`;
+  }
+
+  private buildSnValueRows(row: TraceSnValue): SnValueDisplayRow[] {
+    const values: Record<string, string> = {};
+    this.addSnValue(values, 'ChipId', row.chip_id);
+    this.addSnValue(values, 'IMEI', row.imes);
+
+    const jsonValues = this.parseSnValuesJson(row.ext_values_json);
+    Object.entries(jsonValues).forEach(([key, value]) => this.addSnValue(values, key, value));
+
+    if (!Object.keys(jsonValues).length) {
+      String(row.ext_values_text || '')
+        .split(',')
+        .map((pair) => pair.trim())
+        .filter(Boolean)
+        .forEach((pair) => {
+          const separator = pair.indexOf('|');
+          if (separator > 0) {
+            this.addSnValue(values, pair.slice(0, separator), pair.slice(separator + 1));
+          }
+        });
+    }
+
+    return Object.entries(values).map(([key, value]) => ({ key, value }));
+  }
+
+  private addSnValue(values: Record<string, string>, key: string, value: unknown): void {
+    const cleanKey = String(key || '').trim();
+    const cleanValue = String(value || '').trim();
+    if (cleanKey && cleanValue) {
+      values[cleanKey] = cleanValue;
+    }
+  }
+
+  private parseSnValuesJson(value: TraceSnValue['ext_values_json']): Record<string, string> {
+    if (!value) {
+      return {};
+    }
+
+    if (typeof value === 'object') {
+      return Object.entries(value).reduce<Record<string, string>>((parsed, [key, entryValue]) => {
+        this.addSnValue(parsed, key, entryValue);
+        return parsed;
+      }, {});
+    }
+
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
   }
 
   get previewStationStartTime(): string {
@@ -631,6 +703,9 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
   }
 
   openChildDetails(): void {
+    this.isSnValuesOpen = false;
+    this.activePreviewStation = null;
+    this.activePreviewLogistics = null;
     this.isChildDetailsOpen = true;
   }
 
@@ -638,7 +713,23 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
     this.isChildDetailsOpen = false;
   }
 
+  openSnValues(): void {
+    this.isChildDetailsOpen = false;
+    this.isAssembledPartsOpen = false;
+    this.activePreviewStation = null;
+    this.activePreviewLogistics = null;
+    this.isSnValuesOpen = true;
+  }
+
+  closeSnValues(): void {
+    this.isSnValuesOpen = false;
+  }
+
   openAssembledParts(): void {
+    this.isChildDetailsOpen = false;
+    this.isSnValuesOpen = false;
+    this.activePreviewStation = null;
+    this.activePreviewLogistics = null;
     this.isAssembledPartsOpen = true;
   }
 
@@ -654,6 +745,10 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
       return;
     }
 
+    this.isChildDetailsOpen = false;
+    this.isAssembledPartsOpen = false;
+    this.isSnValuesOpen = false;
+    this.activePreviewLogistics = null;
     this.activePreviewStation = station;
   }
 
@@ -664,6 +759,10 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
   openPreviewLogisticsDetails(event: Event, node: PreviewFlowNode): void {
     event.preventDefault();
     event.stopPropagation();
+    this.isChildDetailsOpen = false;
+    this.isAssembledPartsOpen = false;
+    this.isSnValuesOpen = false;
+    this.activePreviewStation = null;
     this.activePreviewLogistics = node;
   }
 
@@ -703,6 +802,7 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
     this.previewStationStatusById = {};
     this.isChildDetailsOpen = false;
     this.isAssembledPartsOpen = false;
+    this.isSnValuesOpen = false;
     this.activePreviewStation = null;
     this.activePreviewLogistics = null;
 

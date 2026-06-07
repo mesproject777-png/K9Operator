@@ -104,6 +104,7 @@ public static class ConvertedEndpoints
                 "/api/item-revisions",
                 "/api/routing",
                 "/api/workflow",
+                "/api/ws",
                 "/api/stations",
                 "/api/work-orders",
                 "/api/sites",
@@ -1705,6 +1706,30 @@ public static class ConvertedEndpoints
 
     private static void MapExternal(WebApplication app)
     {
+        app.MapGet("/api/ws", async (HttpRequest request) =>
+        {
+            var phpClass = request.Query["php_class"].ToString().Trim();
+            var func = request.Query["func"].ToString().Trim().ToLowerInvariant();
+
+            if (!string.Equals(phpClass, "ws_json", StringComparison.OrdinalIgnoreCase))
+            {
+                return LegacyWsSimpleFail(func, "php_class=ws_json is required", 400);
+            }
+
+            return func switch
+            {
+                "snstatus" => await HandleLegacyWsSnStatusAsync(request),
+                "insertresult" => await HandleLegacyWsInsertResultAsync(request),
+                "snhistory" => await HandleLegacyWsSnHistoryAsync(request),
+                "routeback" => LegacyWsSimpleFail(func, "routeback is routed but not implemented yet", 501),
+                "" => LegacyWsSimpleFail(func, "func is required", 400),
+                _ => LegacyWsSimpleFail(func, $"Unsupported func \"{func}\"", 400)
+            };
+        })
+        .WithName("LegacyMesWs")
+        .WithTags("External")
+        .WithSummary("Legacy QMS/MS3-style MES integration endpoint with func routing.");
+
         app.MapGet("/api/external/sn-status", async (HttpRequest request) =>
         {
             var rsn = request.Query["rsn"].ToString().Trim();
@@ -5540,6 +5565,401 @@ public static class ConvertedEndpoints
         return rows.Count == 0 ? null : rows[0];
     }
 
+    private sealed record LegacyWsContext(
+        string Func,
+        string UserId,
+        string Password,
+        string Sn,
+        string StationCode,
+        Dictionary<string, string> SnValues,
+        Dictionary<string, object?> CredentialStation,
+        Dictionary<string, object?> Serial,
+        Dictionary<string, object?> RequestedStation,
+        List<Dictionary<string, object?>> RouteRows,
+        List<Dictionary<string, object?>> History);
+
+    private static async Task<IResult> HandleLegacyWsSnStatusAsync(HttpRequest request)
+    {
+        await using var connection = await OpenConnectionAsync();
+        var (context, error) = await ResolveLegacyWsContextAsync(connection, request, "snstatus", validateStationProgress: false);
+        if (error is not null)
+        {
+            return error;
+        }
+
+        var legacy = FilterLegacyContextToRequestedStation(context!);
+        var latestRequestedResult = legacy.History.FirstOrDefault();
+        if (latestRequestedResult is not null &&
+            string.Equals(latestRequestedResult["result"]?.ToString(), "FAIL", StringComparison.OrdinalIgnoreCase))
+        {
+            return LegacyWsFail(legacy.Func, "Station already failed", 409, legacy);
+        }
+
+        var currentOrder = ResolveCurrentOrder(legacy.Serial, legacy.RouteRows);
+        var selectedOrder = Convert.ToInt32(legacy.RequestedStation["station_order"]);
+        var blockingStep = FindBlockingRequiredStep(legacy.RouteRows, currentOrder, selectedOrder);
+        if (blockingStep is not null)
+        {
+            var stationName = GetStationDisplayName(blockingStep);
+            return LegacyWsFail(legacy.Func, $"Previous station \"{stationName}\" is not passed", 409, legacy);
+        }
+
+        var requestedStationPassed = latestRequestedResult is not null &&
+            string.Equals(latestRequestedResult["result"]?.ToString(), "PASS", StringComparison.OrdinalIgnoreCase);
+        if (!requestedStationPassed)
+        {
+            var reason = legacy.SnValues.Count > 0
+                ? "Station is not passed. SN values cannot be saved."
+                : "Station is not passed";
+            return LegacyWsFail(legacy.Func, reason, 409, legacy);
+        }
+
+        if (legacy.SnValues.Count > 0)
+        {
+            await UpsertSerialExternalValuesAsync(connection, legacy.Serial, legacy.RequestedStation, legacy.UserId, legacy.SnValues);
+        }
+
+        var externalValues = await GetSerialExternalValuesAsync(connection, legacy.Serial["id"]!);
+        return LegacyWsPass(legacy, string.Empty, externalValues);
+    }
+
+    private static async Task<IResult> HandleLegacyWsSnHistoryAsync(HttpRequest request)
+    {
+        await using var connection = await OpenConnectionAsync();
+        var (context, error) = await ResolveLegacyWsContextAsync(connection, request, "snhistory", validateStationProgress: false);
+        if (error is not null)
+        {
+            return error;
+        }
+
+        var legacy = FilterLegacyContextToRequestedStation(context!);
+        var externalValues = await GetSerialExternalValuesAsync(connection, legacy.Serial["id"]!);
+        return LegacyWsPass(legacy, "SN history returned", externalValues);
+    }
+
+    private static async Task<IResult> HandleLegacyWsInsertResultAsync(HttpRequest request)
+    {
+        await using var connection = await OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync();
+        try
+        {
+            var (context, error) = await ResolveLegacyWsContextAsync(connection, request, "insertresult");
+            if (error is not null)
+            {
+                await transaction.RollbackAsync();
+                return error;
+            }
+
+            var legacy = context!;
+            var requestedResult = request.Query["result"].ToString().Trim();
+            var result = string.IsNullOrWhiteSpace(requestedResult) ? "PASS" : requestedResult.ToUpperInvariant();
+            if (result is not "PASS" and not "FAIL")
+            {
+                await transaction.RollbackAsync();
+                return LegacyWsFail(legacy.Func, "result must be PASS or FAIL", 400, legacy);
+            }
+
+            var remark = request.Query["remark"].ToString().Trim();
+            if (string.IsNullOrWhiteSpace(remark))
+            {
+                remark = result == "PASS" ? "Legacy MES insertresult PASS" : "Legacy MES insertresult FAIL";
+            }
+
+            if (legacy.SnValues.Count > 0)
+            {
+                await UpsertSerialExternalValuesAsync(connection, legacy.Serial, legacy.RequestedStation, legacy.UserId, legacy.SnValues);
+            }
+
+            if (result == "FAIL")
+            {
+                await ExecuteAsync(
+                    connection,
+                    """
+                    UPDATE workflow_serial_numbers
+                    SET status = 'Failed',
+                        condition = 'Bad',
+                        current_station_code = @stationCode,
+                        current_station_order = @stationOrder,
+                        last_moved_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = @id
+                    """,
+                    ("stationCode", legacy.RequestedStation["station_code"]),
+                    ("stationOrder", legacy.RequestedStation["station_order"]),
+                    ("id", legacy.Serial["id"]));
+
+                await InsertWorkflowStationLogAsync(
+                    connection,
+                    legacy.Serial,
+                    legacy.RequestedStation,
+                    "FAIL",
+                    remark,
+                    legacy.UserId,
+                    legacy.Serial["current_station_code"],
+                    legacy.Serial["current_station_order"],
+                    legacy.RequestedStation["station_code"],
+                    legacy.RequestedStation["station_order"]);
+
+                await transaction.CommitAsync();
+                var failedValues = await GetSerialExternalValuesAsync(connection, legacy.Serial["id"]!);
+                return LegacyWsFail(legacy.Func, remark, 200, legacy, failedValues);
+            }
+
+            var selectedOrder = Convert.ToInt32(legacy.RequestedStation["station_order"]);
+            var nextStep = legacy.RouteRows.FirstOrDefault(step => Convert.ToInt32(step["station_order"]) > selectedOrder);
+            var nextStatus = nextStep is null ? "Completed" : "In Process";
+            var nextStationCode = nextStep?["station_code"] ?? legacy.RequestedStation["station_code"];
+            var nextStationOrder = nextStep?["station_order"] ?? legacy.RequestedStation["station_order"];
+
+            await ExecuteAsync(
+                connection,
+                """
+                UPDATE workflow_serial_numbers
+                SET status = @status,
+                    condition = 'Good',
+                    current_station_code = @stationCode,
+                    current_station_order = @stationOrder,
+                    last_moved_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = @id
+                """,
+                ("status", nextStatus),
+                ("stationCode", nextStationCode),
+                ("stationOrder", nextStationOrder),
+                ("id", legacy.Serial["id"]));
+
+            await InsertWorkflowStationLogAsync(
+                connection,
+                legacy.Serial,
+                legacy.RequestedStation,
+                "PASS",
+                remark,
+                legacy.UserId,
+                legacy.Serial["current_station_code"],
+                legacy.Serial["current_station_order"],
+                nextStationCode,
+                nextStationOrder);
+
+            await MirrorWorkflowPassToLegacyTraceAsync(
+                connection,
+                legacy.Serial,
+                legacy.RequestedStation,
+                "PASS",
+                remark,
+                legacy.UserId,
+                legacy.Serial["current_station_code"],
+                legacy.Serial["current_station_order"],
+                nextStationCode,
+                nextStationOrder,
+                nextStatus);
+
+            await transaction.CommitAsync();
+            var externalValues = await GetSerialExternalValuesAsync(connection, legacy.Serial["id"]!);
+            return LegacyWsPass(legacy, "Station result inserted", externalValues);
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
+    }
+
+    private static async Task<(LegacyWsContext? Context, IResult? Error)> ResolveLegacyWsContextAsync(
+        NpgsqlConnection connection,
+        HttpRequest request,
+        string func,
+        bool validateStationProgress = true)
+    {
+        var userId = request.Query["user_id"].ToString().Trim();
+        var password = request.Query["password"].ToString();
+        var sn = request.Query["sn"].ToString().Trim();
+        var stationCode = request.Query["station_code"].ToString().Trim();
+        var snValues = ParseLegacySnValues(request.Query["sn_values"].ToString());
+
+        if (string.IsNullOrWhiteSpace(userId) || string.IsNullOrWhiteSpace(password))
+        {
+            return (null, LegacyWsSimpleFail(func, "user_id and password are required", 400));
+        }
+
+        if (string.IsNullOrWhiteSpace(sn))
+        {
+            return (null, LegacyWsSimpleFail(func, "sn is required", 400));
+        }
+
+        if (string.IsNullOrWhiteSpace(stationCode))
+        {
+            return (null, LegacyWsSimpleFail(func, "station_code is required", 400));
+        }
+
+        await EnsureWorkflowSchemaAsync(connection);
+        await EnsureWorkflowStationLoginsTableAsync(connection);
+        await EnsureSerialExternalValuesTableAsync(connection);
+
+        var serial = await GetWorkflowSerialByQueryAsync(connection, sn);
+        if (serial is null)
+        {
+            return (null, LegacyWsSimpleFail(func, "Serial Number not found", 404));
+        }
+
+        if (serial["workflow_work_order_id"] is null || string.IsNullOrWhiteSpace(serial["wo"]?.ToString()))
+        {
+            return (null, LegacyWsSimpleFail(func, "Work Order not found", 404, serial: serial));
+        }
+
+        var workflowPartId = Convert.ToInt32(serial["workflow_part_id"]);
+        var routeRows = await GetWorkflowRouteRowsForPartAsync(connection, workflowPartId);
+        if (routeRows.Count == 0)
+        {
+            return (null, LegacyWsSimpleFail(func, "Routing not found", 404, serial: serial));
+        }
+
+        var currentOrder = ResolveCurrentOrder(serial, routeRows);
+        var requestedStation = ResolveExternalRequestedStation(serial, routeRows, stationCode, currentOrder);
+        if (requestedStation is null)
+        {
+            return (null, LegacyWsSimpleFail(func, "Station routing not found", 404, serial: serial));
+        }
+
+        var credentialStation = await GetOperatorStationByCredentialsAsync(
+            connection,
+            userId,
+            password,
+            workflowPartId,
+            requestedStation["station_code"]?.ToString());
+        if (credentialStation is null)
+        {
+            return (null, LegacyWsSimpleFail(func, "Invalid operator credentials", 401, serial: serial, currentStation: requestedStation));
+        }
+
+        var history = await BuildExternalSnHistoryAsync(connection, serial, routeRows);
+        var requestedStationCode = requestedStation["station_code"]?.ToString() ?? string.Empty;
+        var stationHistory = history
+            .Where(row => string.Equals(row["stationCode"]?.ToString(), requestedStationCode, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        var latestRequestedResult = stationHistory.FirstOrDefault(row =>
+            string.Equals(row["stationCode"]?.ToString(), requestedStationCode, StringComparison.OrdinalIgnoreCase));
+
+        if (latestRequestedResult is not null &&
+            string.Equals(latestRequestedResult["result"]?.ToString(), "FAIL", StringComparison.OrdinalIgnoreCase))
+        {
+            return (null, LegacyWsSimpleFail(func, "Station already failed", 409, serial, requestedStation, stationHistory));
+        }
+
+        if (validateStationProgress)
+        {
+            var selectedOrder = Convert.ToInt32(requestedStation["station_order"]);
+            var serialStatus = serial["serial_status"]?.ToString();
+            if (selectedOrder < currentOrder ||
+                (selectedOrder == currentOrder && string.Equals(serialStatus, "Completed", StringComparison.OrdinalIgnoreCase)))
+            {
+                return (null, LegacyWsSimpleFail(func, "Station is already passed", 409, serial, requestedStation, history));
+            }
+
+            var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
+            if (blockingStep is not null)
+            {
+                var stationName = GetStationDisplayName(blockingStep);
+                return (null, LegacyWsSimpleFail(func, $"Previous station \"{stationName}\" is not passed", 409, serial, requestedStation, history));
+            }
+        }
+
+        return (new LegacyWsContext(func, userId, password, sn, stationCode, snValues, credentialStation, serial, requestedStation, routeRows, history), null);
+    }
+
+    private static LegacyWsContext FilterLegacyContextToRequestedStation(LegacyWsContext context)
+    {
+        var stationCode = context.RequestedStation["station_code"]?.ToString() ?? string.Empty;
+        var stationHistory = context.History
+            .Where(row => string.Equals(row["stationCode"]?.ToString(), stationCode, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        return context with { History = stationHistory };
+    }
+
+    private static Dictionary<string, string> ParseLegacySnValues(string raw)
+    {
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return values;
+        }
+
+        foreach (var pair in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var separator = pair.IndexOf('|');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var key = pair[..separator].Trim();
+            var value = pair[(separator + 1)..].Trim();
+            if (!string.IsNullOrWhiteSpace(key))
+            {
+                values[key] = value;
+            }
+        }
+
+        return values;
+    }
+
+    private static IResult LegacyWsPass(
+        LegacyWsContext context,
+        string reason,
+        List<Dictionary<string, object?>>? externalValues = null)
+    {
+        return LegacyWsResponse(true, "PASS", reason, context.Func, context.Serial, context.RequestedStation, context.History, context.SnValues, externalValues, 200);
+    }
+
+    private static IResult LegacyWsFail(
+        string func,
+        string reason,
+        int statusCode,
+        LegacyWsContext? context = null,
+        List<Dictionary<string, object?>>? externalValues = null)
+    {
+        return LegacyWsResponse(false, "FAIL", reason, func, context?.Serial, context?.RequestedStation, context?.History, context?.SnValues, externalValues, statusCode);
+    }
+
+    private static IResult LegacyWsSimpleFail(
+        string func,
+        string reason,
+        int statusCode,
+        Dictionary<string, object?>? serial = null,
+        Dictionary<string, object?>? currentStation = null,
+        List<Dictionary<string, object?>>? history = null)
+    {
+        return LegacyWsResponse(false, "FAIL", reason, func, serial, currentStation, history, null, null, statusCode);
+    }
+
+    private static IResult LegacyWsResponse(
+        bool success,
+        string result,
+        string reason,
+        string func,
+        Dictionary<string, object?>? serial,
+        Dictionary<string, object?>? currentStation,
+        List<Dictionary<string, object?>>? history,
+        Dictionary<string, string>? snValues,
+        List<Dictionary<string, object?>>? externalValues,
+        int statusCode)
+    {
+        return Results.Json(new
+        {
+            success,
+            result,
+            reason,
+            func,
+            sn = serial?["sn"]?.ToString() ?? string.Empty,
+            rsn = serial?["rsn"]?.ToString() ?? string.Empty,
+            wo = serial?["wo"]?.ToString() ?? string.Empty,
+            pn = serial?["pn"]?.ToString() ?? string.Empty,
+            station_code = currentStation?["station_code"]?.ToString() ?? serial?["current_station_code"]?.ToString() ?? string.Empty,
+            station_name = currentStation?["station_name"]?.ToString() ?? string.Empty,
+            sn_values = snValues ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        }, statusCode: statusCode);
+    }
+
     private static Dictionary<string, object?>? ResolveExternalRequestedStation(
         Dictionary<string, object?> serial,
         List<Dictionary<string, object?>> routeRows,
@@ -5662,6 +6082,8 @@ public static class ConvertedEndpoints
               station_name VARCHAR(220),
               chip_id VARCHAR(220),
               imes VARCHAR(220),
+              ext_values_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+              ext_values_text TEXT,
               pushed_by VARCHAR(160) NOT NULL,
               pushed_at TIMESTAMP NOT NULL DEFAULT NOW(),
               updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -5669,6 +6091,8 @@ public static class ConvertedEndpoints
             )
             """);
 
+        await ExecuteAsync(connection, "ALTER TABLE public.serial_external_values ADD COLUMN IF NOT EXISTS ext_values_json JSONB NOT NULL DEFAULT '{}'::jsonb");
+        await ExecuteAsync(connection, "ALTER TABLE public.serial_external_values ADD COLUMN IF NOT EXISTS ext_values_text TEXT");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_serial_external_values_serial ON public.serial_external_values (workflow_serial_id)");
     }
 
@@ -5680,18 +6104,46 @@ public static class ConvertedEndpoints
         string chipId,
         string imes)
     {
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(chipId))
+        {
+            values["ChipId"] = chipId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(imes))
+        {
+            values["IMEI"] = imes;
+        }
+
+        await UpsertSerialExternalValuesAsync(connection, serial, station, pushedBy, values);
+    }
+
+    private static async Task UpsertSerialExternalValuesAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> serial,
+        Dictionary<string, object?> station,
+        string pushedBy,
+        Dictionary<string, string> extValues)
+    {
+        var chipId = ReadExternalValue(extValues, "ChipId", "CHIP_ID", "Chip ID");
+        var imes = ReadExternalValue(extValues, "IMEI", "IMES", "IMEIs");
+        var extValuesJson = JsonSerializer.Serialize(extValues);
+        var extValuesText = string.Join(",", extValues.Select(pair => $"{pair.Key}|{pair.Value}"));
+
         await ExecuteAsync(
             connection,
             """
             INSERT INTO public.serial_external_values
-              (workflow_serial_id, station_code, station_name, chip_id, imes, pushed_by, pushed_at, updated_at)
+              (workflow_serial_id, station_code, station_name, chip_id, imes, ext_values_json, ext_values_text, pushed_by, pushed_at, updated_at)
             VALUES
-              (@serialId, @stationCode, @stationName, @chipId, @imes, @pushedBy, NOW(), NOW())
+              (@serialId, @stationCode, @stationName, @chipId, @imes, CAST(@extValuesJson AS jsonb), @extValuesText, @pushedBy, NOW(), NOW())
             ON CONFLICT (workflow_serial_id, station_code)
             DO UPDATE SET
               station_name = EXCLUDED.station_name,
               chip_id = COALESCE(NULLIF(EXCLUDED.chip_id, ''), public.serial_external_values.chip_id),
               imes = COALESCE(NULLIF(EXCLUDED.imes, ''), public.serial_external_values.imes),
+              ext_values_json = public.serial_external_values.ext_values_json || EXCLUDED.ext_values_json,
+              ext_values_text = EXCLUDED.ext_values_text,
               pushed_by = EXCLUDED.pushed_by,
               updated_at = NOW()
             """,
@@ -5700,7 +6152,22 @@ public static class ConvertedEndpoints
             ("stationName", station["station_name"]),
             ("chipId", chipId),
             ("imes", imes),
+            ("extValuesJson", extValuesJson),
+            ("extValuesText", extValuesText),
             ("pushedBy", pushedBy));
+    }
+
+    private static string ReadExternalValue(Dictionary<string, string> values, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (values.TryGetValue(key, out var value))
+            {
+                return value;
+            }
+        }
+
+        return string.Empty;
     }
 
     private static async Task<List<Dictionary<string, object?>>> GetSerialExternalValuesAsync(
@@ -5710,7 +6177,7 @@ public static class ConvertedEndpoints
         return await QueryRowsAsync(
             connection,
             """
-            SELECT station_code, station_name, chip_id, imes, pushed_by, pushed_at, updated_at
+            SELECT station_code, station_name, chip_id, imes, ext_values_json, ext_values_text, pushed_by, pushed_at, updated_at
             FROM public.serial_external_values
             WHERE workflow_serial_id = @serialId
             ORDER BY updated_at DESC, id DESC
@@ -6491,6 +6958,8 @@ public static class ConvertedEndpoints
         var palletNo = multiboxRows.Count > 0 ? multiboxRows[0]["pallet_no"] : null;
         var shipmentNo = multiboxRows.Count > 0 ? multiboxRows[0]["shipment_no"] : null;
         var assembledParts = await GetWorkflowSerialAssembledPartsAsync(connection, serial["id"]!);
+        await EnsureSerialExternalValuesTableAsync(connection);
+        var snValues = await GetSerialExternalValuesAsync(connection, serial["id"]!);
         var history = await QueryRowsAsync(
             connection,
             """
@@ -6575,6 +7044,7 @@ public static class ConvertedEndpoints
             progress = new { total = routing.Count, completed, current = current is null ? 0 : 1, pending, percent },
             routing,
             history,
+            sn_values = snValues,
             assembled_parts = assembledParts,
             generated_at = DateTime.UtcNow
         };

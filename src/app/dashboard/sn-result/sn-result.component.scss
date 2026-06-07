@@ -1374,6 +1374,19 @@ button.preview-node:focus-visible {
   font-weight: 800;
 }
 
+.sn-values-summary strong {
+  overflow-wrap: anywhere;
+}
+
+.sn-values-table table {
+  min-width: 720px;
+}
+
+.sn-values-table td {
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
 .station-detail-list dt::after {
   content: ':';
   position: absolute;
