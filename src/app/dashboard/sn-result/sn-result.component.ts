@@ -52,7 +52,7 @@ type LabelPrnTemplateDto = {
 };
 
 type SnResultTab = 'preview' | 'history';
-type PreviewStatus = 'Passed' | 'In Progress' | 'Pending' | 'Skipped';
+type PreviewStatus = 'Passed' | 'In Progress' | 'Pending' | 'Skipped' | 'Failed';
 
 type WorkflowSnapshot = {
   partNumber?: {
@@ -601,11 +601,11 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
       return true;
     }
 
-    if (eventType && eventType !== 'PASS') {
+    if (eventType && eventType !== 'PASS' && eventType !== 'FAIL') {
       return false;
     }
 
-    return result === 'PASS';
+    return result === 'PASS' || result === 'FAIL';
   }
 
   private shouldShowSnHistoryDisplayRow(row: SnHistoryDisplayRow): boolean {
@@ -615,7 +615,7 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
       return false;
     }
 
-    return action.startsWith('PASS') || action.startsWith('SN_GENERATED') || action.includes('BOM_BIND');
+    return action.startsWith('PASS') || action.startsWith('FAIL') || action.startsWith('SN_GENERATED') || action.includes('BOM_BIND');
   }
 
   private hasGeneratedHistoryRow(rows: TraceHistoryRow[]): boolean {
@@ -890,13 +890,38 @@ export class SnResultComponent implements AfterViewInit, AfterViewChecked, OnDes
 
   private buildTraceStatusesByStationCode(): Record<string, PreviewStatus> {
     return (this.traceResult?.routing || []).reduce<Record<string, PreviewStatus>>((statuses, step) => {
-      statuses[step.station_code] = step.state === 'completed'
+      statuses[step.station_code] = this.isStationFailed(step.station_code)
+        ? 'Failed'
+        : step.state === 'completed'
         ? 'Passed'
         : step.state === 'current'
           ? 'In Progress'
           : 'Pending';
       return statuses;
     }, {});
+  }
+
+  private isStationFailed(stationCode: string): boolean {
+    const normalizedStation = String(stationCode || '').trim().toUpperCase();
+    if (!normalizedStation) {
+      return false;
+    }
+
+    const stationRows = (this.traceResult?.history || [])
+      .filter((history) => String(history.station || '').trim().toUpperCase() === normalizedStation)
+      .map((history) => ({
+        result: String(history.result || '').trim().toUpperCase(),
+        date: this.parseHistoryTimestamp(history.date_time),
+      }))
+      .filter((history) => history.result === 'PASS' || history.result === 'FAIL')
+      .sort((a, b) => b.date - a.date);
+
+    return stationRows[0]?.result === 'FAIL';
+  }
+
+  private parseHistoryTimestamp(value: string | null | undefined): number {
+    const timestamp = value ? new Date(value).getTime() : 0;
+    return Number.isFinite(timestamp) ? timestamp : 0;
   }
 
   private buildPreviewConnectorSignature(): string {

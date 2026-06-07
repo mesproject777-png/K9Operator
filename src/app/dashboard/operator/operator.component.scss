@@ -292,12 +292,23 @@
   width: min(520px, 100%);
 }
 
+.fail-remark-entry {
+  width: min(340px, 100%);
+}
+
 .serial-entry label {
   color: #24364a;
   font-size: 0.72rem;
   font-weight: 900;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.serial-entry label span {
+  color: #6b7d90;
+  font-weight: 800;
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .serial-entry input {
@@ -332,6 +343,22 @@
   cursor: pointer;
 }
 
+.fail-button {
+  height: 38px;
+  min-width: 104px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 18px;
+  border: 1px solid #dc2626;
+  border-radius: 8px;
+  background: #dc2626;
+  color: #ffffff;
+  font-size: 0.92rem;
+  font-weight: 950;
+  cursor: pointer;
+}
+
 .reset-button {
   height: 48px;
   min-width: 104px;
@@ -354,6 +381,7 @@
 }
 
 .pass-button:disabled,
+.fail-button:disabled,
 .reset-button:disabled {
   opacity: 0.65;
   cursor: not-allowed;
@@ -695,6 +723,7 @@
 
   .serial-entry,
   .pass-button,
+  .fail-button,
   .reset-button {
     width: 100%;
   }

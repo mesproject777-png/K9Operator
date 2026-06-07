@@ -218,7 +218,7 @@
         </ng-container>
 
         <ng-template #emptyOperatorState>
-          <p class="empty-message">Enter a serial number below to pass this station.</p>
+          <p class="empty-message">Enter a serial number below to pass or fail this station.</p>
         </ng-template>
       </div>
     </ng-template>
@@ -232,6 +232,7 @@
         id="operatorSerial"
         type="text"
         [(ngModel)]="serialNumber"
+        (ngModelChange)="onSerialNumberChange($event)"
         name="operatorSerial"
         placeholder="Enter serial number"
         autocomplete="off"
@@ -249,6 +250,18 @@
       />
     </div>
 
+    <div class="serial-entry fail-remark-entry" *ngIf="!bindingContext && showFailRemarkEntry">
+      <label for="operatorFailRemark">Fail Remark <span>Optional</span></label>
+      <input
+        id="operatorFailRemark"
+        type="text"
+        [(ngModel)]="failRemark"
+        name="operatorFailRemark"
+        placeholder="Enter fail remark"
+        autocomplete="off"
+      />
+    </div>
+
     <button
       type="button"
       class="reset-button"
@@ -261,6 +274,10 @@
 
     <button type="button" class="pass-button" [class.passed]="isPassed" [disabled]="isOperatorBusy" (click)="passSerial()">
       {{ footerButtonLabel }}
+    </button>
+
+    <button type="button" class="fail-button" [disabled]="isOperatorBusy || !!bindingContext" (click)="failSerial()">
+      {{ failButtonLabel }}
     </button>
 
   </footer>

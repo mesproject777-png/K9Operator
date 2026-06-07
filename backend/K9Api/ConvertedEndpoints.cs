@@ -201,6 +201,152 @@ public static class ConvertedEndpoints
                 return JsonError("Site is in use by work orders", 409);
             }
         });
+
+        app.MapPost("/api/operator/fail", async (HttpContext context) =>
+        {
+            var payload = await ReadJsonBodyAsync(context.Request);
+            var query = ReadString(payload, "query")?.Trim();
+            var loginId = ReadString(payload, "loginId")?.Trim();
+            var debugRemark = ReadString(payload, "remark")?.Trim();
+            var requestedWorkflowPartId = ReadInt(payload, "workflowPartId");
+            if (string.IsNullOrWhiteSpace(query) || string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonMessage("Serial number and login ID are required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            await using var transaction = await connection.BeginTransactionAsync();
+            try
+            {
+                var operatorStation = await GetOperatorStationByLoginAsync(connection, loginId, requestedWorkflowPartId);
+                if (operatorStation is null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Station login session is no longer assigned. Please login again", 401);
+                }
+
+                var serial = await GetWorkflowSerialByQueryAsync(connection, query);
+                if (serial is null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("SN/RSN not found", 404);
+                }
+
+                var workflowPartId = Convert.ToInt32(serial["workflow_part_id"]);
+                if (Convert.ToInt32(operatorStation["workflow_part_id"]) != workflowPartId)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("This station login is not assigned to this serial number part number", 409);
+                }
+
+                var routeRows = await GetWorkflowRouteRowsForPartAsync(connection, workflowPartId);
+                var selected = routeRows.FirstOrDefault(step =>
+                    string.Equals(step["station_code"]?.ToString(), operatorStation["station_code"]?.ToString(), StringComparison.OrdinalIgnoreCase));
+                if (selected is null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Logged-in station is not in this serial route", 409);
+                }
+
+                var currentOrder = ResolveCurrentOrder(serial, routeRows);
+                var selectedOrder = Convert.ToInt32(selected["station_order"]);
+                var serialStatus = serial["serial_status"]?.ToString();
+                if (selectedOrder < currentOrder || (selectedOrder == currentOrder && string.Equals(serialStatus, "Completed", StringComparison.OrdinalIgnoreCase)))
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage("Station is already passed", 409);
+                }
+
+                var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
+                if (blockingStep is not null)
+                {
+                    var stationName = GetStationDisplayName(blockingStep);
+                    await transaction.RollbackAsync();
+                    return JsonMessage($"Previous station \"{stationName}\" is failed. Please pass that station before continuing.", 409);
+                }
+
+                var serialNumber = serial["sn"]?.ToString() ?? query;
+                var stationNameForMessage = GetStationDisplayName(selected);
+                var existingFailureCount = await GetContinuousWorkflowFailureCountAsync(connection, serial["id"]!, selected["station_code"]?.ToString());
+                if (existingFailureCount >= 3)
+                {
+                    var existingRepairConfig = await GetWorkflowRepairStationConfigAsync(connection, workflowPartId, selected["station_code"]?.ToString());
+                    var existingRepairStep = ResolveRepairRouteStep(routeRows, existingRepairConfig?["repair_station_name"]?.ToString());
+                    if (existingRepairConfig is not null &&
+                        existingRepairConfig["is_repair_station_enabled"] is bool existingRepairEnabled && existingRepairEnabled &&
+                        existingRepairStep is not null)
+                    {
+                        await transaction.RollbackAsync();
+                        return JsonMessage($"{serialNumber} went to repair station {GetStationDisplayName(existingRepairStep)}.", 409);
+                    }
+
+                    await transaction.RollbackAsync();
+                    return JsonMessage($"{serialNumber} is already failed three times in station {stationNameForMessage}.", 409);
+                }
+
+                var failureCount = existingFailureCount + 1;
+                var repairConfig = await GetWorkflowRepairStationConfigAsync(connection, workflowPartId, selected["station_code"]?.ToString());
+                var repairStep = failureCount >= 3
+                    ? ResolveRepairRouteStep(routeRows, repairConfig?["repair_station_name"]?.ToString())
+                    : null;
+                var shouldMoveToRepair = failureCount >= 3 && repairConfig is not null &&
+                    repairConfig["is_repair_station_enabled"] is bool enabled && enabled &&
+                    repairStep is not null;
+                var nextStatus = shouldMoveToRepair ? "Repair" : "Failed";
+                var afterStationCode = shouldMoveToRepair ? repairStep!["station_code"] : selected["station_code"];
+                var afterStationOrder = shouldMoveToRepair ? repairStep!["station_order"] : selected["station_order"];
+                var remark = shouldMoveToRepair
+                    ? $"{serialNumber} is failed three times, so it went to repair station {GetStationDisplayName(repairStep!)}."
+                    : $"SN is failed for {ToOrdinal(failureCount)} time in station {stationNameForMessage}.";
+
+                await ExecuteAsync(
+                    connection,
+                    """
+                    UPDATE workflow_serial_numbers
+                    SET status = @status,
+                        condition = 'NG',
+                        current_station_code = @stationCode,
+                        current_station_order = @stationOrder,
+                        last_moved_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = @id
+                    """,
+                    ("status", nextStatus),
+                    ("stationCode", afterStationCode),
+                    ("stationOrder", afterStationOrder),
+                    ("id", serial["id"]));
+
+                await InsertWorkflowStationLogAsync(
+                    connection,
+                    serial,
+                    selected,
+                    "FAIL",
+                    remark,
+                    loginId,
+                    serial["current_station_code"],
+                    serial["current_station_order"],
+                    afterStationCode,
+                    afterStationOrder,
+                    debugRemark);
+
+                await transaction.CommitAsync();
+                return Results.Json(new
+                {
+                    message = shouldMoveToRepair
+                        ? remark
+                        : $"{serialNumber} ({serialNumber}) is failed in station name {stationNameForMessage}.",
+                    fail_count = failureCount,
+                    status = nextStatus,
+                    repair_station = shouldMoveToRepair ? GetStationDisplayName(repairStep!) : null
+                });
+            }
+            catch
+            {
+                await transaction.RollbackAsync();
+                throw;
+            }
+        });
     }
 
     private static void MapUserLogin(WebApplication app)
@@ -1332,6 +1478,24 @@ public static class ConvertedEndpoints
                 var serialStatus = serial["serial_status"]?.ToString();
                 if (selectedOrder < currentOrder || (selectedOrder == currentOrder && string.Equals(serialStatus, "Completed", StringComparison.OrdinalIgnoreCase)))
                 {
+                    var repairRedirectMessage = await ResolveRepairRedirectMessageAsync(connection, serial, workflowPartId, routeRows, selected, query);
+                    if (repairRedirectMessage is not null)
+                    {
+                        await InsertWorkflowStationLogAsync(
+                            connection,
+                            serial,
+                            selected,
+                            "NOT_PASS",
+                            repairRedirectMessage,
+                            loginId,
+                            serial["current_station_code"],
+                            serial["current_station_order"],
+                            serial["current_station_code"],
+                            serial["current_station_order"]);
+                        await transaction.CommitAsync();
+                        return JsonMessage(repairRedirectMessage, 409);
+                    }
+
                     await InsertWorkflowStationLogAsync(
                         connection,
                         serial,
@@ -1364,6 +1528,25 @@ public static class ConvertedEndpoints
                         serial["current_station_order"]);
                     await transaction.CommitAsync();
                     return JsonMessage($"Previous station \"{stationName}\" is not passed", 409);
+                }
+
+                var failedPreviousStep = await FindLatestFailedPreviousStepAsync(connection, serial["id"]!, workflowPartId, routeRows, selectedOrder);
+                if (failedPreviousStep is not null)
+                {
+                    var stationName = GetStationDisplayName(failedPreviousStep);
+                    await InsertWorkflowStationLogAsync(
+                        connection,
+                        serial,
+                        selected,
+                        "NOT_PASS",
+                        $"Previous station \"{stationName}\" is failed",
+                        loginId,
+                        serial["current_station_code"],
+                        serial["current_station_order"],
+                        serial["current_station_code"],
+                        serial["current_station_order"]);
+                    await transaction.CommitAsync();
+                    return JsonMessage($"Previous station \"{stationName}\" is failed. Please pass that station before continuing.", 409);
                 }
 
                 var samplingDecision = await ResolveSamplingDecisionAsync(connection, workflowPartId, selected, serial);
@@ -4988,6 +5171,12 @@ public static class ConvertedEndpoints
         var serialStatus = serial["serial_status"]?.ToString();
         if (selectedOrder < currentOrder || (selectedOrder == currentOrder && string.Equals(serialStatus, "Completed", StringComparison.OrdinalIgnoreCase)))
         {
+            var repairRedirectMessage = await ResolveRepairRedirectMessageAsync(connection, serial, workflowPartId, routeRows, selected, query);
+            if (repairRedirectMessage is not null)
+            {
+                return (null, JsonMessage(repairRedirectMessage, 409));
+            }
+
             return (null, JsonMessage("Station is already passed", 409));
         }
 
@@ -4996,6 +5185,13 @@ public static class ConvertedEndpoints
         {
             var stationName = GetStationDisplayName(blockingStep);
             return (null, JsonMessage($"Previous station \"{stationName}\" is not passed", 409));
+        }
+
+        var failedPreviousStep = await FindLatestFailedPreviousStepAsync(connection, serial["id"]!, workflowPartId, routeRows, selectedOrder);
+        if (failedPreviousStep is not null)
+        {
+            var stationName = GetStationDisplayName(failedPreviousStep);
+            return (null, JsonMessage($"Previous station \"{stationName}\" is failed. Please pass that station before continuing.", 409));
         }
 
         return (new OperatorWorkflowContext(operatorStation, serial, selected, routeRows, currentOrder, selectedOrder), null);
@@ -5266,6 +5462,234 @@ public static class ConvertedEndpoints
         return text.Contains("PACK", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static async Task<Dictionary<string, object?>?> FindLatestFailedPreviousStepAsync(
+        NpgsqlConnection connection,
+        object workflowSerialId,
+        int workflowPartId,
+        List<Dictionary<string, object?>> routeRows,
+        int selectedOrder)
+    {
+        var previousSteps = routeRows
+            .Where(step => Convert.ToInt32(step["station_order"]) < selectedOrder)
+            .Where(step => !string.IsNullOrWhiteSpace(step["station_code"]?.ToString()))
+            .ToList();
+
+        if (previousSteps.Count == 0)
+        {
+            return null;
+        }
+
+        var previousCodes = previousSteps
+            .Select(step => step["station_code"]!.ToString()!)
+            .ToArray();
+
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT DISTINCT ON (UPPER(station_code)) station_code, action_result, created_at
+            FROM workflow_serial_station_logs
+            WHERE workflow_serial_id = @serialId
+              AND station_code = ANY(@stationCodes)
+              AND UPPER(action_result) IN ('PASS', 'FAIL')
+            ORDER BY UPPER(station_code), created_at DESC, id DESC
+            """,
+            ("serialId", workflowSerialId),
+            ("stationCodes", previousCodes));
+
+        var latestByStation = rows
+            .Where(row => !string.IsNullOrWhiteSpace(row["station_code"]?.ToString()))
+            .ToDictionary(row => row["station_code"]!.ToString()!, row => row, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var step in previousSteps)
+        {
+            var stationCode = step["station_code"]?.ToString() ?? string.Empty;
+            if (!latestByStation.TryGetValue(stationCode, out var latest) ||
+                !string.Equals(latest["action_result"]?.ToString(), "FAIL", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (await IsFailureClearedByRepairAsync(connection, workflowSerialId, workflowPartId, routeRows, step, selectedOrder, latest["created_at"]))
+            {
+                continue;
+            }
+
+            return step;
+        }
+
+        return null;
+    }
+
+    private static async Task<bool> IsFailureClearedByRepairAsync(
+        NpgsqlConnection connection,
+        object workflowSerialId,
+        int workflowPartId,
+        List<Dictionary<string, object?>> routeRows,
+        Dictionary<string, object?> failedStep,
+        int selectedOrder,
+        object? failedAt)
+    {
+        var repairConfig = await GetWorkflowRepairStationConfigAsync(connection, workflowPartId, failedStep["station_code"]?.ToString());
+        if (repairConfig is null ||
+            repairConfig["is_repair_station_enabled"] is not bool enabled ||
+            !enabled)
+        {
+            return false;
+        }
+
+        var repairStep = ResolveRepairRouteStep(routeRows, repairConfig["repair_station_name"]?.ToString());
+        if (repairStep is null)
+        {
+            return false;
+        }
+
+        var failedOrder = Convert.ToInt32(failedStep["station_order"]);
+        var repairOrder = Convert.ToInt32(repairStep["station_order"]);
+        if (repairOrder <= failedOrder || repairOrder > selectedOrder)
+        {
+            return false;
+        }
+
+        if (repairOrder == selectedOrder)
+        {
+            return true;
+        }
+
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT id
+            FROM workflow_serial_station_logs
+            WHERE workflow_serial_id = @serialId
+              AND UPPER(station_code) = UPPER(@repairStationCode)
+              AND UPPER(action_result) = 'PASS'
+              AND created_at > @failedAt
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            ("serialId", workflowSerialId),
+            ("repairStationCode", repairStep["station_code"]),
+            ("failedAt", failedAt));
+
+        return rows.Count > 0;
+    }
+
+    private static async Task<string?> ResolveRepairRedirectMessageAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> serial,
+        int workflowPartId,
+        List<Dictionary<string, object?>> routeRows,
+        Dictionary<string, object?> selected,
+        string query)
+    {
+        if (!string.Equals(serial["serial_status"]?.ToString(), "Repair", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var repairConfig = await GetWorkflowRepairStationConfigAsync(connection, workflowPartId, selected["station_code"]?.ToString());
+        if (repairConfig is null ||
+            repairConfig["is_repair_station_enabled"] is not bool enabled ||
+            !enabled)
+        {
+            return null;
+        }
+
+        var repairStep = ResolveRepairRouteStep(routeRows, repairConfig["repair_station_name"]?.ToString());
+        if (repairStep is null ||
+            !string.Equals(repairStep["station_code"]?.ToString(), serial["current_station_code"]?.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var serialNumber = serial["sn"]?.ToString() ?? query;
+        return $"{serialNumber} went to repair station {GetStationDisplayName(repairStep)}.";
+    }
+
+    private static async Task<int> GetContinuousWorkflowFailureCountAsync(
+        NpgsqlConnection connection,
+        object workflowSerialId,
+        string? stationCode)
+    {
+        if (string.IsNullOrWhiteSpace(stationCode))
+        {
+            return 0;
+        }
+
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            WITH last_pass AS (
+                SELECT COALESCE(MAX(created_at), '-infinity'::timestamp) AS passed_at
+                FROM workflow_serial_station_logs
+                WHERE workflow_serial_id = @serialId
+                  AND UPPER(station_code) = UPPER(@stationCode)
+                  AND UPPER(action_result) = 'PASS'
+            )
+            SELECT COUNT(*)::int AS fail_count
+            FROM workflow_serial_station_logs logs, last_pass
+            WHERE logs.workflow_serial_id = @serialId
+              AND UPPER(logs.station_code) = UPPER(@stationCode)
+              AND UPPER(logs.action_result) = 'FAIL'
+              AND logs.created_at > last_pass.passed_at
+            """,
+            ("serialId", workflowSerialId),
+            ("stationCode", stationCode));
+
+        return rows.Count > 0 ? Convert.ToInt32(rows[0]["fail_count"] ?? 0) : 0;
+    }
+
+    private static async Task<Dictionary<string, object?>?> GetWorkflowRepairStationConfigAsync(
+        NpgsqlConnection connection,
+        int workflowPartId,
+        string? stationCode)
+    {
+        if (string.IsNullOrWhiteSpace(stationCode))
+        {
+            return null;
+        }
+
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT repair_station_name, is_repair_station_enabled
+            FROM workflow_station_repair
+            WHERE workflow_part_id = @workflowPartId
+              AND UPPER(station_code) = UPPER(@stationCode)
+            LIMIT 1
+            """,
+            ("workflowPartId", workflowPartId),
+            ("stationCode", stationCode));
+
+        return rows.Count == 0 ? null : rows[0];
+    }
+
+    private static Dictionary<string, object?>? ResolveRepairRouteStep(
+        List<Dictionary<string, object?>> routeRows,
+        string? repairStationName)
+    {
+        var repairName = repairStationName?.Trim();
+        if (string.IsNullOrWhiteSpace(repairName))
+        {
+            return null;
+        }
+
+        return routeRows.FirstOrDefault(step =>
+            string.Equals(step["station_code"]?.ToString(), repairName, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(step["station_name"]?.ToString(), repairName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string ToOrdinal(int value)
+    {
+        return value switch
+        {
+            1 => "first",
+            2 => "second",
+            3 => "third",
+            _ => $"{value}th"
+        };
+    }
+
     private static async Task<SamplingDecision> ResolveSamplingDecisionAsync(
         NpgsqlConnection connection,
         int workflowPartId,
@@ -5359,7 +5783,8 @@ public static class ConvertedEndpoints
         object? beforeStationCode,
         object? beforeStationOrder,
         object? afterStationCode,
-        object? afterStationOrder)
+        object? afterStationOrder,
+        string? debugRemark = null)
     {
         await ExecuteAsync(
             connection,
@@ -5367,10 +5792,10 @@ public static class ConvertedEndpoints
             INSERT INTO workflow_serial_station_logs
               (workflow_serial_id, workflow_part_id, workflow_work_order_id, station_code, station_name,
                action_result, remark, changed_by, before_station_code, before_station_order,
-               after_station_code, after_station_order)
+               after_station_code, after_station_order, debug_remark)
             VALUES
               (@serialId, @partId, @workOrderId, @stationCode, @stationName,
-               @result, @remark, @changedBy, @beforeCode, @beforeOrder, @afterCode, @afterOrder)
+               @result, @remark, @changedBy, @beforeCode, @beforeOrder, @afterCode, @afterOrder, @debugRemark)
             """,
             ("serialId", serial["id"]),
             ("partId", serial["workflow_part_id"]),
@@ -5383,7 +5808,8 @@ public static class ConvertedEndpoints
             ("beforeCode", beforeStationCode),
             ("beforeOrder", beforeStationOrder),
             ("afterCode", afterStationCode),
-            ("afterOrder", afterStationOrder));
+            ("afterOrder", afterStationOrder),
+            ("debugRemark", ToDbNullable(debugRemark)));
     }
 
     private static async Task MirrorWorkflowPassToLegacyTraceAsync(
@@ -7829,6 +8255,27 @@ public static class ConvertedEndpoints
         await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_sampling ADD COLUMN IF NOT EXISTS station_id INTEGER");
         await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_sampling ADD COLUMN IF NOT EXISTS is_sampling_enabled BOOLEAN NOT NULL DEFAULT FALSE");
 
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.workflow_station_repair (
+              id SERIAL PRIMARY KEY,
+              workflow_part_id INTEGER NOT NULL REFERENCES workflow_part_numbers(id) ON DELETE CASCADE,
+              station_code VARCHAR(80) NOT NULL,
+              station_id INTEGER,
+              station_name VARCHAR(220),
+              repair_station_name VARCHAR(220),
+              is_repair_station_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_workflow_station_repair UNIQUE (workflow_part_id, station_code)
+            )
+            """);
+
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_repair ADD COLUMN IF NOT EXISTS station_id INTEGER");
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_repair ADD COLUMN IF NOT EXISTS repair_station_name VARCHAR(220)");
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_station_repair ADD COLUMN IF NOT EXISTS is_repair_station_enabled BOOLEAN NOT NULL DEFAULT FALSE");
+
         await ExecuteAsync(connection, "CREATE SEQUENCE IF NOT EXISTS public.workflow_rsn_seq START WITH 1");
         await ExecuteAsync(
             connection,
@@ -7864,6 +8311,7 @@ public static class ConvertedEndpoints
               station_name VARCHAR(220),
               action_result VARCHAR(10) NOT NULL,
               remark TEXT,
+              debug_remark TEXT,
               changed_by VARCHAR(100) NOT NULL DEFAULT 'system',
               before_station_code VARCHAR(80),
               before_station_order INTEGER,
@@ -7989,6 +8437,7 @@ public static class ConvertedEndpoints
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_bom_bind_child ON public.workflow_serial_bom_bindings (child_workflow_serial_id)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_serial ON public.workflow_serial_station_logs (workflow_serial_id, created_at DESC)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_station_logs_station ON public.workflow_serial_station_logs (workflow_part_id, station_code)");
+        await ExecuteAsync(connection, "ALTER TABLE public.workflow_serial_station_logs ADD COLUMN IF NOT EXISTS debug_remark TEXT");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_multiboxes_open ON public.workflow_multiboxes (workflow_part_id, workflow_work_order_id, status)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_pallets_open ON public.workflow_pallets (created_by, status)");
         await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_workflow_shipments_open ON public.workflow_shipments (created_by, status)");

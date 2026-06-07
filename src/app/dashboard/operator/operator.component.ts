@@ -51,6 +51,13 @@ interface OperatorPassResponse {
   label_printing?: unknown;
 }
 
+interface OperatorFailResponse {
+  message?: string;
+  fail_count?: number;
+  status?: string;
+  repair_station?: string;
+}
+
 type PackagingMode = 'multibox' | 'pallet' | 'shipment';
 
 interface PackagingItem {
@@ -98,12 +105,18 @@ interface PackagingHistoryItem {
 export class OperatorComponent implements OnDestroy {
   serialNumber = '';
   childSerialNumber = '';
+  failRemark = '';
+  showFailRemarkEntry = false;
   displayedSerial = '';
   showResultPanel = false;
   isPassing = false;
+  isFailing = false;
   isCheckingAssembly = false;
   isBindingChild = false;
   isPassed = false;
+  isFailed = false;
+  failedSerialNumber = '';
+  failedRepairMessage = '';
   isMultiboxOpen = false;
   isMultiboxLoading = false;
   multiboxSerial = '';
@@ -139,6 +152,7 @@ export class OperatorComponent implements OnDestroy {
         this.errorMessage = '';
         this.successMessage = '';
         this.isPassed = false;
+        this.resetFailureState();
         this.showResultPanel = true;
         this.bindingContext = null;
         this.childSerialNumber = '';
@@ -149,6 +163,7 @@ export class OperatorComponent implements OnDestroy {
       this.showResultPanel = false;
       this.bindingContext = null;
       this.childSerialNumber = '';
+      this.resetFailureState();
     });
   }
 
@@ -185,6 +200,14 @@ export class OperatorComponent implements OnDestroy {
     this.checkAssemblyRequirement(query);
   }
 
+  onSerialNumberChange(value: string): void {
+    this.showFailRemarkEntry = false;
+    this.failRemark = '';
+    if (this.isFailed && String(value || '').trim().toUpperCase() !== this.failedSerialNumber.toUpperCase()) {
+      this.resetFailureState();
+    }
+  }
+
   resetBindingSession(): void {
     this.bindingContext = null;
     this.childSerialNumber = '';
@@ -194,7 +217,7 @@ export class OperatorComponent implements OnDestroy {
   }
 
   get isOperatorBusy(): boolean {
-    return this.isPassing || this.isCheckingAssembly || this.isBindingChild;
+    return this.isPassing || this.isFailing || this.isCheckingAssembly || this.isBindingChild;
   }
 
   get footerButtonLabel(): string {
@@ -202,11 +225,23 @@ export class OperatorComponent implements OnDestroy {
       return this.bindingContext ? 'Checking...' : 'Entering...';
     }
 
+    if (this.isPassed) {
+      return 'Passed';
+    }
+
     if (!this.bindingContext) {
-      return 'Enter';
+      return 'Pass';
     }
 
     return this.bindingContext.remaining > 0 ? 'Bind' : 'Pass Station';
+  }
+
+  get failButtonLabel(): string {
+    if (this.isFailing) {
+      return 'Failing...';
+    }
+
+    return this.isFailed ? 'Failed' : 'Fail';
   }
 
   get requiredChildSummary(): string {
@@ -303,6 +338,14 @@ export class OperatorComponent implements OnDestroy {
       return;
     }
 
+    if (this.isFailed && query.trim().toUpperCase() === this.failedSerialNumber.toUpperCase()) {
+      this.successMessage = '';
+      this.errorMessage = this.failedRepairMessage || `${query} went to repair station.`;
+      return;
+    }
+
+    this.showFailRemarkEntry = false;
+    this.failRemark = '';
     this.isPassing = true;
     this.http.post<OperatorPassResponse>(`${this.apiUrl}/pass`, {
       query,
@@ -332,6 +375,74 @@ export class OperatorComponent implements OnDestroy {
         this.errorMessage = error?.error?.message || error?.error?.error || 'Unable to pass station.';
       },
     });
+  }
+
+  failSerial(): void {
+    this.errorMessage = '';
+    this.successMessage = '';
+    this.isPassed = false;
+
+    if (this.bindingContext) {
+      this.errorMessage = 'Reset the child binding session before failing this serial.';
+      return;
+    }
+
+    const query = this.serialNumber.trim();
+    if (!query) {
+      this.errorMessage = 'Please enter serial number.';
+      return;
+    }
+
+    if (this.isFailed && query.toUpperCase() === this.failedSerialNumber.toUpperCase()) {
+      this.errorMessage = this.failedRepairMessage || `${query} went to repair station.`;
+      return;
+    }
+
+    if (!this.currentUser?.login_id) {
+      this.errorMessage = 'Station login session is missing. Please login again.';
+      return;
+    }
+
+    if (!this.showFailRemarkEntry) {
+      this.showFailRemarkEntry = true;
+      return;
+    }
+
+    this.isFailing = true;
+    this.http.post<OperatorFailResponse>(`${this.apiUrl}/fail`, {
+      query,
+      loginId: this.currentUser.login_id,
+      workflowPartId: this.currentUser.workflow_part_id,
+      remark: this.failRemark.trim(),
+    }).subscribe({
+      next: (response) => {
+        this.isFailing = false;
+        this.displayedSerial = query;
+        this.showResultPanel = false;
+        this.successMessage = '';
+        this.errorMessage = 'Station is failed';
+        this.failRemark = '';
+        this.showFailRemarkEntry = false;
+        if (Number(response?.fail_count || 0) >= 3) {
+          const repairStation = String(response?.repair_station || '').trim();
+          this.isFailed = true;
+          this.failedSerialNumber = query;
+          this.failedRepairMessage = repairStation
+            ? `${query} went to repair station ${repairStation}.`
+            : `${query} went to repair station.`;
+        }
+      },
+      error: (error) => {
+        this.isFailing = false;
+        this.errorMessage = error?.error?.message || error?.error?.error || 'Unable to fail station.';
+      },
+    });
+  }
+
+  private resetFailureState(): void {
+    this.isFailed = false;
+    this.failedSerialNumber = '';
+    this.failedRepairMessage = '';
   }
 
   canUseMultibox(): boolean {
