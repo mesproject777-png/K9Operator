@@ -115,6 +115,7 @@ public static class ConvertedEndpoints
         MapSites(app);
         MapUserLogin(app);
         MapOperator(app);
+        MapExternal(app);
         MapStations(app);
         MapItems(app);
         MapItemRevisions(app);
@@ -1700,6 +1701,120 @@ public static class ConvertedEndpoints
                 throw;
             }
         });
+    }
+
+    private static void MapExternal(WebApplication app)
+    {
+        app.MapGet("/api/external/sn-status", async (HttpRequest request) =>
+        {
+            var rsn = request.Query["rsn"].ToString().Trim();
+            var userId = request.Query["userId"].ToString().Trim();
+            var password = request.Query["password"].ToString();
+            var stationCode = request.Query["stationCode"].ToString().Trim();
+            var chipId = request.Query["chipId"].ToString().Trim();
+            var imes = request.Query["imes"].ToString().Trim();
+
+            if (string.IsNullOrWhiteSpace(rsn))
+            {
+                return ExternalSnStatusError("rsn is required", 400);
+            }
+
+            if (string.IsNullOrWhiteSpace(userId) || string.IsNullOrWhiteSpace(password))
+            {
+                return ExternalSnStatusError("userId and password are required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            await EnsureWorkflowStationLoginsTableAsync(connection);
+            await EnsureSerialExternalValuesTableAsync(connection);
+
+            var hasValidOperatorCredentials = await HasValidOperatorCredentialsAsync(connection, userId, password);
+            if (!hasValidOperatorCredentials)
+            {
+                return ExternalSnStatusError("Invalid operator credentials", 401);
+            }
+
+            var serial = await GetWorkflowSerialByQueryAsync(connection, rsn);
+            if (serial is null)
+            {
+                return ExternalSnStatusError("Serial Number not found", 404);
+            }
+
+            if (serial["workflow_work_order_id"] is null || string.IsNullOrWhiteSpace(serial["wo"]?.ToString()))
+            {
+                return ExternalSnStatusError("Work Order not found", 404, serial);
+            }
+
+            var workflowPartId = Convert.ToInt32(serial["workflow_part_id"]);
+            var routeRows = await GetWorkflowRouteRowsForPartAsync(connection, workflowPartId);
+            if (routeRows.Count == 0)
+            {
+                return ExternalSnStatusError("Routing not found", 404, serial);
+            }
+
+            var currentOrder = ResolveCurrentOrder(serial, routeRows);
+            var requestedStation = ResolveExternalRequestedStation(serial, routeRows, stationCode, currentOrder);
+            if (requestedStation is null)
+            {
+                return ExternalSnStatusError("Routing not found", 404, serial);
+            }
+
+            var credentialStation = await GetOperatorStationByCredentialsAsync(
+                connection,
+                userId,
+                password,
+                workflowPartId,
+                requestedStation["station_code"]?.ToString());
+            if (credentialStation is null)
+            {
+                return ExternalSnStatusError("Invalid operator credentials", 401, serial);
+            }
+
+            var history = await BuildExternalSnHistoryAsync(connection, serial, routeRows);
+            var stationHistory = history
+                .Where(row => string.Equals(row["stationCode"]?.ToString(), requestedStation["station_code"]?.ToString(), StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            var requestedStationCode = requestedStation["station_code"]?.ToString() ?? string.Empty;
+            var latestRequestedResult = stationHistory.FirstOrDefault(row =>
+                string.Equals(row["stationCode"]?.ToString(), requestedStationCode, StringComparison.OrdinalIgnoreCase));
+            var requestedStationPassed = latestRequestedResult is not null &&
+                string.Equals(latestRequestedResult["result"]?.ToString(), "PASS", StringComparison.OrdinalIgnoreCase);
+
+            if (latestRequestedResult is not null &&
+                string.Equals(latestRequestedResult["result"]?.ToString(), "FAIL", StringComparison.OrdinalIgnoreCase))
+            {
+                return ExternalSnStatusResponse(false, "FAIL", "Station already failed", serial, requestedStation, stationHistory, null, 409);
+            }
+
+            var selectedOrder = Convert.ToInt32(requestedStation["station_order"]);
+            var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
+            if (blockingStep is not null)
+            {
+                var stationName = GetStationDisplayName(blockingStep);
+                return ExternalSnStatusResponse(false, "FAIL", $"Previous station \"{stationName}\" is not passed", serial, requestedStation, stationHistory, null, 409);
+            }
+
+            var hasExternalValues = !string.IsNullOrWhiteSpace(chipId) || !string.IsNullOrWhiteSpace(imes);
+            if (!requestedStationPassed)
+            {
+                var reason = hasExternalValues
+                    ? "Station is not passed. External values cannot be saved."
+                    : "Station is not passed";
+                return ExternalSnStatusResponse(false, "FAIL", reason, serial, requestedStation, stationHistory, null, 409);
+            }
+
+            if (hasExternalValues)
+            {
+                await UpsertSerialExternalValuesAsync(connection, serial, requestedStation, userId, chipId, imes);
+            }
+
+            var externalValues = await GetSerialExternalValuesAsync(connection, serial["id"]!);
+            return ExternalSnStatusResponse(true, "PASS", string.Empty, serial, requestedStation, stationHistory, externalValues);
+        })
+        .WithName("GetExternalSnStatus")
+        .WithTags("External")
+        .WithSummary("Validates K9Operator station credentials and returns SN routing status.");
     }
 
     private static void MapStations(WebApplication app)
@@ -5302,6 +5417,305 @@ public static class ConvertedEndpoints
             ("workflowPartId", workflowPartId),
             ("stationCode", stationCode?.Trim() ?? string.Empty));
         return rows.Count == 0 ? null : rows[0];
+    }
+
+    private static async Task<bool> HasValidOperatorCredentialsAsync(
+        NpgsqlConnection connection,
+        string loginId,
+        string password)
+    {
+        var station = await GetOperatorStationByCredentialsAsync(connection, loginId, password);
+        return station is not null;
+    }
+
+    private static async Task<Dictionary<string, object?>?> GetOperatorStationByCredentialsAsync(
+        NpgsqlConnection connection,
+        string loginId,
+        string password,
+        int? workflowPartId = null,
+        string? stationCode = null)
+    {
+        await EnsureWorkflowStationLoginsTableAsync(connection);
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              station.station_code,
+              station.station_name,
+              station.station_order,
+              station.workflow_part_id,
+              station.station_login_id,
+              station.box_qty,
+              station.workflow_work_order_id
+            FROM (
+                SELECT
+                  r.station_code,
+                  r.station_name,
+                  r.station_order,
+                  r.workflow_part_id,
+                  l.station_login_id,
+                  p.box_qty,
+                  COALESCE(w.id, latest_w.id) AS workflow_work_order_id,
+                  l.updated_at,
+                  l.id,
+                  0 AS source_priority
+                FROM workflow_station_logins l
+                JOIN workflow_routing_steps r ON r.id = l.workflow_routing_step_id
+                JOIN workflow_part_numbers p ON p.id = r.workflow_part_id
+                LEFT JOIN workflow_work_orders w ON w.id = l.workflow_work_order_id
+                LEFT JOIN LATERAL (
+                    SELECT ww.id
+                    FROM workflow_work_orders ww
+                    WHERE ww.workflow_part_id = p.id
+                    ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                    LIMIT 1
+                ) latest_w ON TRUE
+                WHERE UPPER(l.station_login_id) = UPPER(@loginId)
+                  AND l.station_login_password = @password
+                  AND (@workflowPartId::integer IS NULL OR r.workflow_part_id = @workflowPartId::integer)
+                  AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))
+
+                UNION ALL
+
+                SELECT
+                  r.station_code,
+                  r.station_name,
+                  r.station_order,
+                  p.id AS workflow_part_id,
+                  r.station_login_id,
+                  p.box_qty,
+                  w.id AS workflow_work_order_id,
+                  r.updated_at,
+                  r.id,
+                  1 AS source_priority
+                FROM item_routing_steps r
+                JOIN items i ON i.id = r.item_id
+                LEFT JOIN workflow_part_numbers p ON UPPER(p.pn) = UPPER(i.pn)
+                LEFT JOIN LATERAL (
+                    SELECT ww.id
+                    FROM workflow_work_orders ww
+                    WHERE ww.workflow_part_id = p.id
+                    ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                    LIMIT 1
+                ) w ON TRUE
+                WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+                  AND r.station_login_password = @password
+                  AND (@workflowPartId::integer IS NULL OR p.id = @workflowPartId::integer)
+                  AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))
+
+                UNION ALL
+
+                SELECT
+                  r.station_code,
+                  r.station_name,
+                  r.station_order,
+                  r.workflow_part_id,
+                  r.station_login_id,
+                  p.box_qty,
+                  w.id AS workflow_work_order_id,
+                  r.updated_at,
+                  r.id,
+                  2 AS source_priority
+                FROM workflow_routing_steps r
+                JOIN workflow_part_numbers p ON p.id = r.workflow_part_id
+                LEFT JOIN LATERAL (
+                    SELECT ww.id
+                    FROM workflow_work_orders ww
+                    WHERE ww.workflow_part_id = p.id
+                    ORDER BY ww.updated_at DESC NULLS LAST, ww.id DESC
+                    LIMIT 1
+                ) w ON TRUE
+                WHERE UPPER(r.station_login_id) = UPPER(@loginId)
+                  AND r.station_login_password = @password
+                  AND (@workflowPartId::integer IS NULL OR r.workflow_part_id = @workflowPartId::integer)
+                  AND (@stationCode::text = '' OR UPPER(r.station_code) = UPPER(@stationCode::text))
+            ) station
+            ORDER BY station.source_priority ASC, station.updated_at DESC, station.id DESC
+            LIMIT 1
+            """,
+            ("loginId", loginId),
+            ("password", password),
+            ("workflowPartId", workflowPartId),
+            ("stationCode", stationCode?.Trim() ?? string.Empty));
+        return rows.Count == 0 ? null : rows[0];
+    }
+
+    private static Dictionary<string, object?>? ResolveExternalRequestedStation(
+        Dictionary<string, object?> serial,
+        List<Dictionary<string, object?>> routeRows,
+        string stationCode,
+        int currentOrder)
+    {
+        if (!string.IsNullOrWhiteSpace(stationCode))
+        {
+            return routeRows.FirstOrDefault(step =>
+                string.Equals(step["station_code"]?.ToString(), stationCode, StringComparison.OrdinalIgnoreCase));
+        }
+
+        var currentStation = routeRows.FirstOrDefault(step => Convert.ToInt32(step["station_order"]) == currentOrder);
+        if (currentStation is not null)
+        {
+            return currentStation;
+        }
+
+        var serialStationCode = serial["current_station_code"]?.ToString();
+        return routeRows.FirstOrDefault(step =>
+            string.Equals(step["station_code"]?.ToString(), serialStationCode, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> BuildExternalSnHistoryAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> serial,
+        List<Dictionary<string, object?>> routeRows)
+    {
+        var logRows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT station_code, station_name, action_result, remark, created_at
+            FROM workflow_serial_station_logs
+            WHERE workflow_serial_id = @serialId
+            ORDER BY created_at DESC, id DESC
+            """,
+            ("serialId", serial["id"]));
+
+        return routeRows.Select(step =>
+        {
+            var stationCode = step["station_code"]?.ToString() ?? string.Empty;
+            var latestLog = logRows.FirstOrDefault(log =>
+                string.Equals(log["station_code"]?.ToString(), stationCode, StringComparison.OrdinalIgnoreCase));
+            var result = latestLog is null ? "PENDING" : NormalizeExternalStationResult(latestLog["action_result"]?.ToString());
+
+            return new Dictionary<string, object?>
+            {
+                ["stationCode"] = stationCode,
+                ["stationName"] = step["station_name"]?.ToString() ?? string.Empty,
+                ["result"] = result,
+                ["dateTime"] = latestLog?["created_at"],
+                ["reason"] = latestLog?["remark"]?.ToString() ?? string.Empty
+            };
+        }).ToList();
+    }
+
+    private static string NormalizeExternalStationResult(string? result)
+    {
+        if (string.Equals(result, "PASS", StringComparison.OrdinalIgnoreCase))
+        {
+            return "PASS";
+        }
+
+        if (string.Equals(result, "CANCELLED", StringComparison.OrdinalIgnoreCase))
+        {
+            return "CANCELLED";
+        }
+
+        if (string.Equals(result, "FAIL", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(result, "NOT_PASS", StringComparison.OrdinalIgnoreCase))
+        {
+            return "FAIL";
+        }
+
+        return "PENDING";
+    }
+
+    private static IResult ExternalSnStatusError(
+        string reason,
+        int statusCode,
+        Dictionary<string, object?>? serial = null)
+    {
+        return ExternalSnStatusResponse(false, "FAIL", reason, serial, null, new List<Dictionary<string, object?>>(), null, statusCode);
+    }
+
+    private static IResult ExternalSnStatusResponse(
+        bool success,
+        string result,
+        string reason,
+        Dictionary<string, object?>? serial,
+        Dictionary<string, object?>? currentStation,
+        List<Dictionary<string, object?>> history,
+        List<Dictionary<string, object?>>? externalValues,
+        int statusCode = 200)
+    {
+        return Results.Json(new
+        {
+            success,
+            result,
+            reason,
+            serialNumber = serial?["sn"]?.ToString() ?? string.Empty,
+            rsn = serial?["rsn"]?.ToString() ?? string.Empty,
+            workOrder = serial?["wo"]?.ToString() ?? string.Empty,
+            partNumber = serial?["pn"]?.ToString() ?? string.Empty,
+            currentStation = currentStation?["station_code"]?.ToString() ?? serial?["current_station_code"]?.ToString() ?? string.Empty,
+            values = externalValues ?? new List<Dictionary<string, object?>>(),
+            history
+        }, statusCode: statusCode);
+    }
+
+    private static async Task EnsureSerialExternalValuesTableAsync(NpgsqlConnection connection)
+    {
+        await ExecuteAsync(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS public.serial_external_values (
+              id BIGSERIAL PRIMARY KEY,
+              workflow_serial_id BIGINT NOT NULL REFERENCES workflow_serial_numbers(id) ON DELETE CASCADE,
+              station_code VARCHAR(80) NOT NULL,
+              station_name VARCHAR(220),
+              chip_id VARCHAR(220),
+              imes VARCHAR(220),
+              pushed_by VARCHAR(160) NOT NULL,
+              pushed_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              CONSTRAINT uq_serial_external_values_station UNIQUE (workflow_serial_id, station_code)
+            )
+            """);
+
+        await ExecuteAsync(connection, "CREATE INDEX IF NOT EXISTS idx_serial_external_values_serial ON public.serial_external_values (workflow_serial_id)");
+    }
+
+    private static async Task UpsertSerialExternalValuesAsync(
+        NpgsqlConnection connection,
+        Dictionary<string, object?> serial,
+        Dictionary<string, object?> station,
+        string pushedBy,
+        string chipId,
+        string imes)
+    {
+        await ExecuteAsync(
+            connection,
+            """
+            INSERT INTO public.serial_external_values
+              (workflow_serial_id, station_code, station_name, chip_id, imes, pushed_by, pushed_at, updated_at)
+            VALUES
+              (@serialId, @stationCode, @stationName, @chipId, @imes, @pushedBy, NOW(), NOW())
+            ON CONFLICT (workflow_serial_id, station_code)
+            DO UPDATE SET
+              station_name = EXCLUDED.station_name,
+              chip_id = COALESCE(NULLIF(EXCLUDED.chip_id, ''), public.serial_external_values.chip_id),
+              imes = COALESCE(NULLIF(EXCLUDED.imes, ''), public.serial_external_values.imes),
+              pushed_by = EXCLUDED.pushed_by,
+              updated_at = NOW()
+            """,
+            ("serialId", serial["id"]),
+            ("stationCode", station["station_code"]),
+            ("stationName", station["station_name"]),
+            ("chipId", chipId),
+            ("imes", imes),
+            ("pushedBy", pushedBy));
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetSerialExternalValuesAsync(
+        NpgsqlConnection connection,
+        object workflowSerialId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT station_code, station_name, chip_id, imes, pushed_by, pushed_at, updated_at
+            FROM public.serial_external_values
+            WHERE workflow_serial_id = @serialId
+            ORDER BY updated_at DESC, id DESC
+            """,
+            ("serialId", workflowSerialId));
     }
 
     private static async Task<List<Dictionary<string, object?>>> GetWorkflowBomLinesForStationAsync(
