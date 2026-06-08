@@ -209,7 +209,63 @@
         </div>
       </div>
 
-      <div *ngIf="!showResultPanel && !bindingContext" class="status-card" [class.success]="successMessage" [class.error]="errorMessage">
+      <div
+        *ngIf="!showResultPanel && !bindingContext && samplingContext as sampling"
+        class="sampling-card"
+        [class.selected]="sampling.isRequired"
+        [class.skipped]="!sampling.isRequired"
+      >
+        <div class="sampling-header">
+          <span class="material-symbols-outlined" aria-hidden="true">
+            {{ sampling.isRequired ? 'fact_check' : 'rule' }}
+          </span>
+          <div>
+            <p>Sampling</p>
+            <h2>{{ sampling.serial.sn }}</h2>
+            <small>{{ sampling.stationCode }} - {{ sampling.stationName }}</small>
+          </div>
+        </div>
+
+        <div class="sampling-decision">
+          <strong>{{ sampling.isRequired ? 'Selected for sampling' : 'Not selected for sampling' }}</strong>
+          <span>{{ sampling.reason }}</span>
+        </div>
+
+        <div class="sampling-counters">
+          <div>
+            <span>Type</span>
+            <strong>{{ sampling.samplingType }}</strong>
+          </div>
+          <div>
+            <span>SN Index</span>
+            <strong>{{ sampling.generatedIndex }}</strong>
+          </div>
+          <div *ngIf="sampling.samplingType === 'PERIODIC' || sampling.samplingType === 'RANDOM'">
+            <span>Interval</span>
+            <strong>{{ sampling.intervalQty }}</strong>
+          </div>
+          <div *ngIf="sampling.samplingType !== 'FIRST_PIECE'">
+            <span>Sample Qty</span>
+            <strong>{{ sampling.sampleQty }}</strong>
+          </div>
+          <div *ngIf="sampling.samplingType === 'LOT'">
+            <span>Lot Size</span>
+            <strong>{{ sampling.lotSize }}</strong>
+          </div>
+        </div>
+
+        <p
+          *ngIf="errorMessage || successMessage"
+          class="sampling-message"
+          [class.error]="errorMessage"
+          [class.success]="!errorMessage && successMessage"
+          aria-live="polite"
+        >
+          {{ errorMessage || successMessage }}
+        </p>
+      </div>
+
+      <div *ngIf="!showResultPanel && !bindingContext && !samplingContext" class="status-card" [class.success]="successMessage" [class.error]="errorMessage">
         <ng-container *ngIf="successMessage || errorMessage; else emptyOperatorState">
           <div class="status-icon" aria-hidden="true">
             <span class="material-symbols-outlined">{{ successMessage ? 'thumb_up' : 'thumb_down' }}</span>
@@ -276,7 +332,7 @@
       {{ footerButtonLabel }}
     </button>
 
-    <button type="button" class="fail-button" [disabled]="isOperatorBusy || !!bindingContext" (click)="failSerial()">
+    <button type="button" class="fail-button" [disabled]="isOperatorBusy || !!bindingContext || (samplingContext && !samplingContext.isRequired)" (click)="failSerial()">
       {{ failButtonLabel }}
     </button>
 

@@ -1,11 +1,3 @@
-
-> k9-operator@0.0.0 start:api
-> npm run stop:api && dotnet run --project backend/K9Api --urls http://localhost:5001
-
-
-> k9-operator@0.0.0 stop:api
-> powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-k9-operator-api.ps1
-
 info: Microsoft.Hosting.Lifetime[14]
       Now listening on: http://localhost:5001
 info: Microsoft.Hosting.Lifetime[0]
@@ -13,4 +5,4 @@ info: Microsoft.Hosting.Lifetime[0]
 info: Microsoft.Hosting.Lifetime[0]
       Hosting environment: Production
 info: Microsoft.Hosting.Lifetime[0]
-      Content root path: C:\Users\venka\OneDrive\My Projects\K9MES-OP\K9Operator\backend\K9Api
+      Content root path: C:\Users\manik\OneDrive\MES2026\K9Operator\backend\K9Api

@@ -51,6 +51,30 @@ interface OperatorPassResponse {
   label_printing?: unknown;
 }
 
+interface OperatorSamplingStatusResponse {
+  stationCode: string;
+  stationName: string;
+  sampleMode: string;
+  isSamplingStation: boolean;
+  isEnabled: boolean;
+  isRequired: boolean;
+  samplingType: string;
+  reason: string;
+  generatedIndex: number;
+  intervalQty: number;
+  sampleQty: number;
+  lotSize: number;
+  groupStart: number;
+  groupEnd: number;
+  serial: {
+    id: number;
+    sn: string;
+    rsn: string;
+    pn: string;
+    wo: string;
+  };
+}
+
 interface OperatorFailResponse {
   message?: string;
   fail_count?: number;
@@ -112,6 +136,7 @@ export class OperatorComponent implements OnDestroy {
   isPassing = false;
   isFailing = false;
   isCheckingAssembly = false;
+  isCheckingSampling = false;
   isBindingChild = false;
   isPassed = false;
   isFailed = false;
@@ -130,11 +155,13 @@ export class OperatorComponent implements OnDestroy {
   successMessage = '';
   errorMessage = '';
   bindingContext: OperatorAssemblyStatusResponse | null = null;
+  samplingContext: OperatorSamplingStatusResponse | null = null;
   currentUser: AuthUser | null = null;
 
   private readonly apiUrl = `${environment.apiUrl}/api/operator`;
   private readonly assemblyStatusApi = `${this.apiUrl}/assembly/status`;
   private readonly assemblyBindApi = `${this.apiUrl}/assembly/bind`;
+  private readonly samplingStatusApi = `${this.apiUrl}/sampling/status`;
   private readonly routeSub: Subscription;
 
   constructor(
@@ -155,6 +182,7 @@ export class OperatorComponent implements OnDestroy {
         this.resetFailureState();
         this.showResultPanel = true;
         this.bindingContext = null;
+        this.samplingContext = null;
         this.childSerialNumber = '';
         return;
       }
@@ -162,6 +190,7 @@ export class OperatorComponent implements OnDestroy {
       this.displayedSerial = '';
       this.showResultPanel = false;
       this.bindingContext = null;
+      this.samplingContext = null;
       this.childSerialNumber = '';
       this.resetFailureState();
     });
@@ -175,6 +204,11 @@ export class OperatorComponent implements OnDestroy {
     this.errorMessage = '';
     this.successMessage = '';
     this.isPassed = false;
+
+    if (this.samplingContext) {
+      this.completePass(this.samplingContext.serial.sn || this.serialNumber.trim());
+      return;
+    }
 
     if (this.bindingContext) {
       if (this.bindingContext.remaining > 0) {
@@ -203,6 +237,9 @@ export class OperatorComponent implements OnDestroy {
   onSerialNumberChange(value: string): void {
     this.showFailRemarkEntry = false;
     this.failRemark = '';
+    if (this.samplingContext && String(value || '').trim().toUpperCase() !== this.samplingContext.serial.sn.toUpperCase()) {
+      this.resetSamplingState();
+    }
     if (this.isFailed && String(value || '').trim().toUpperCase() !== this.failedSerialNumber.toUpperCase()) {
       this.resetFailureState();
     }
@@ -212,12 +249,13 @@ export class OperatorComponent implements OnDestroy {
     this.bindingContext = null;
     this.childSerialNumber = '';
     this.displayedSerial = '';
+    this.resetSamplingState();
     this.successMessage = '';
     this.errorMessage = '';
   }
 
   get isOperatorBusy(): boolean {
-    return this.isPassing || this.isFailing || this.isCheckingAssembly || this.isBindingChild;
+    return this.isPassing || this.isFailing || this.isCheckingAssembly || this.isCheckingSampling || this.isBindingChild;
   }
 
   get footerButtonLabel(): string {
@@ -227,6 +265,10 @@ export class OperatorComponent implements OnDestroy {
 
     if (this.isPassed) {
       return 'Passed';
+    }
+
+    if (this.samplingContext) {
+      return this.samplingContext.isRequired ? 'Pass Sample' : 'Auto Pass';
     }
 
     if (!this.bindingContext) {
@@ -285,11 +327,47 @@ export class OperatorComponent implements OnDestroy {
           return;
         }
 
-        this.completePass(query);
+        this.checkSamplingRequirement(query);
       },
       error: (error) => {
         this.isCheckingAssembly = false;
         this.errorMessage = error?.error?.message || error?.error?.error || 'Unable to check BOM binding requirement.';
+      },
+    });
+  }
+
+  private checkSamplingRequirement(query: string): void {
+    if (!this.currentUser?.login_id) {
+      this.errorMessage = 'Station login session is missing. Please login again.';
+      return;
+    }
+
+    this.isCheckingSampling = true;
+    let params = new HttpParams()
+      .set('query', query)
+      .set('loginId', this.currentUser.login_id);
+    if (this.currentUser.workflow_part_id) {
+      params = params.set('workflowPartId', String(this.currentUser.workflow_part_id));
+    }
+
+    this.http.get<OperatorSamplingStatusResponse>(this.samplingStatusApi, { params }).subscribe({
+      next: (status) => {
+        this.isCheckingSampling = false;
+
+        if (!status.isSamplingStation || !status.isEnabled) {
+          this.completePass(query);
+          return;
+        }
+
+        this.samplingContext = status;
+        this.displayedSerial = status.serial.sn || query;
+        this.successMessage = status.isRequired
+          ? 'This serial is selected for sampling. Complete inspection, then pass or fail.'
+          : 'This serial is not selected by the sampling rule. Use Auto Pass to move it forward.';
+      },
+      error: (error) => {
+        this.isCheckingSampling = false;
+        this.errorMessage = error?.error?.message || error?.error?.error || 'Unable to check sampling requirement.';
       },
     });
   }
@@ -322,7 +400,7 @@ export class OperatorComponent implements OnDestroy {
           : 'All required child serials bound. Passing station...';
 
         if (status.remaining === 0) {
-          this.completePass(status.parent.sn);
+          this.checkSamplingRequirement(status.parent.sn);
         }
       },
       error: (error) => {
@@ -358,6 +436,7 @@ export class OperatorComponent implements OnDestroy {
         this.displayedSerial = '';
         this.showResultPanel = false;
         this.bindingContext = null;
+        this.samplingContext = null;
         this.childSerialNumber = '';
         this.serialNumber = '';
         this.successMessage = response?.message || 'Station passed successfully.';
@@ -384,6 +463,11 @@ export class OperatorComponent implements OnDestroy {
 
     if (this.bindingContext) {
       this.errorMessage = 'Reset the child binding session before failing this serial.';
+      return;
+    }
+
+    if (this.samplingContext && !this.samplingContext.isRequired) {
+      this.errorMessage = 'This serial is not selected for sampling. Use Auto Pass.';
       return;
     }
 
@@ -419,6 +503,7 @@ export class OperatorComponent implements OnDestroy {
         this.isFailing = false;
         this.displayedSerial = query;
         this.showResultPanel = false;
+        this.samplingContext = null;
         this.successMessage = '';
         this.errorMessage = 'Station is failed';
         this.failRemark = '';
@@ -443,6 +528,10 @@ export class OperatorComponent implements OnDestroy {
     this.isFailed = false;
     this.failedSerialNumber = '';
     this.failedRepairMessage = '';
+  }
+
+  private resetSamplingState(): void {
+    this.samplingContext = null;
   }
 
   canUseMultibox(): boolean {

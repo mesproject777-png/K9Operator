@@ -621,6 +621,69 @@ public static class ConvertedEndpoints
             });
         });
 
+        app.MapGet("/api/operator/sampling/status", async (HttpRequest request) =>
+        {
+            var query = request.Query["query"].ToString().Trim();
+            var loginId = request.Query["loginId"].ToString().Trim();
+            var workflowPartIdFilter = int.TryParse(request.Query["workflowPartId"].ToString(), out var parsedWorkflowPartId)
+                ? parsedWorkflowPartId
+                : (int?)null;
+            if (string.IsNullOrWhiteSpace(query) || string.IsNullOrWhiteSpace(loginId))
+            {
+                return JsonMessage("Serial number and login ID are required", 400);
+            }
+
+            await using var connection = await OpenConnectionAsync();
+            await EnsureWorkflowSchemaAsync(connection);
+            var contextResult = await ResolveOperatorWorkflowContextAsync(connection, query, loginId, workflowPartIdFilter);
+            if (contextResult.Error is not null)
+            {
+                return contextResult.Error;
+            }
+
+            var operatorContext = contextResult.Context!;
+            var station = operatorContext.Selected;
+            var serial = operatorContext.Serial;
+            var samplingDecision = await ResolveSamplingDecisionAsync(
+                connection,
+                Convert.ToInt32(serial["workflow_part_id"]),
+                station,
+                serial);
+            var isSamplingStation = string.Equals(station["sample_mode"]?.ToString(), "Sample", StringComparison.OrdinalIgnoreCase);
+            var groupStart = samplingDecision.IntervalQty > 0
+                ? ((samplingDecision.GeneratedIndex - 1) / samplingDecision.IntervalQty) * samplingDecision.IntervalQty + 1
+                : samplingDecision.GeneratedIndex;
+            var groupEnd = samplingDecision.IntervalQty > 0
+                ? groupStart + samplingDecision.IntervalQty - 1
+                : samplingDecision.GeneratedIndex;
+
+            return Results.Json(new
+            {
+                stationCode = station["station_code"],
+                stationName = station["station_name"],
+                sampleMode = station["sample_mode"],
+                isSamplingStation,
+                isEnabled = samplingDecision.IsEnabled,
+                isRequired = samplingDecision.IsRequired,
+                samplingType = samplingDecision.SamplingType,
+                reason = samplingDecision.Reason,
+                generatedIndex = samplingDecision.GeneratedIndex,
+                intervalQty = samplingDecision.IntervalQty,
+                sampleQty = samplingDecision.SampleQty,
+                lotSize = samplingDecision.LotSize,
+                groupStart,
+                groupEnd,
+                serial = new
+                {
+                    id = serial["id"],
+                    sn = serial["sn"],
+                    rsn = serial["rsn"],
+                    pn = serial["pn"],
+                    wo = serial["wo"]
+                }
+            });
+        });
+
         app.MapPut("/api/operator/label-printing-config", async (HttpContext context) =>
         {
             var payload = await ReadJsonBodyAsync(context.Request);
@@ -4898,7 +4961,7 @@ public static class ConvertedEndpoints
         var rows = await QueryRowsAsync(
             connection,
             """
-            SELECT snr.id, snr.sn, snr.rsn, snr.status AS serial_status, snr.condition,
+            SELECT snr.id, snr.sn, snr.rsn, snr.generated_index, snr.status AS serial_status, snr.condition,
                    snr.current_station_code, snr.current_station_order, snr.last_moved_at,
                    snr.created_at, snr.updated_at,
                    w.id AS workflow_work_order_id, w.wo, w.status AS wo_status, w.qty AS wo_qty,
