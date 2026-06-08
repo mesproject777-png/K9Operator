@@ -123,6 +123,45 @@ type PreviewFlowRow = {
   turnSide: 'left' | 'right';
 };
 
+type StationLabelPrintingConfig = {
+  stationId: number | null;
+  stationName: string;
+  isLabelPrintingEnabled: boolean;
+  labelCode: string;
+  labelDescription: string;
+  printerId: string;
+  printerName: string;
+  ipAddress: string;
+  port: string;
+  status: string;
+};
+
+type StationWeighingConfig = {
+  stationId: number | null;
+  stationName: string;
+  isWeighingEnabled: boolean;
+  minimumWeight: string;
+  maximumWeight: string;
+  tolerance: string;
+};
+
+type StationSamplingConfig = {
+  stationId: number | null;
+  stationName: string;
+  isSamplingEnabled: boolean;
+  samplingType: string;
+  intervalQty: string;
+  sampleQty: string;
+  lotSize: string;
+};
+
+type StationRepairConfig = {
+  stationId: number | null;
+  stationName: string;
+  isRepairStationEnabled: boolean;
+  repairStationName: string;
+};
+
 type WorkflowSnapshot = {
   partNumber?: {
     pn?: string;
@@ -147,6 +186,10 @@ type WorkflowSnapshot = {
   routing?: Array<RoutingStepRow & { preview_status?: PreviewStatus | null }>;
   bom?: BomChildRow[];
   stationRules?: Record<string, string[]>;
+  stationLabelPrinting?: Record<string, StationLabelPrintingConfig>;
+  stationWeighing?: Record<string, StationWeighingConfig>;
+  stationSampling?: Record<string, StationSamplingConfig>;
+  stationRepair?: Record<string, StationRepairConfig>;
   previewStatuses?: Record<string, PreviewStatus>;
 };
 
@@ -229,6 +272,10 @@ export class WorkflowComponent implements OnInit, AfterViewInit, AfterViewChecke
   activeRulesStationName = '';
   stationRulesDraft = '';
   stationRulesByStation: Record<string, string[]> = {};
+  stationLabelPrintingByStation: Record<string, StationLabelPrintingConfig> = {};
+  stationWeighingByStation: Record<string, StationWeighingConfig> = {};
+  stationSamplingByStation: Record<string, StationSamplingConfig> = {};
+  stationRepairByStation: Record<string, StationRepairConfig> = {};
   isStationLoginModalOpen = false;
   isEditingStationLogin = true;
   activeStationLoginStep: RoutingStepRow | null = null;
@@ -1020,7 +1067,61 @@ export class WorkflowComponent implements OnInit, AfterViewInit, AfterViewChecke
       return [];
     }
 
-    return this.stationRulesByStation[this.activePreviewStation.station_code] || [];
+    return this.buildEnabledStationTasks(this.activePreviewStation.station_code);
+  }
+
+  private buildEnabledStationTasks(stationCode: string): string[] {
+    const code = String(stationCode || '').trim();
+    if (!code) {
+      return [];
+    }
+
+    const tasks: string[] = [];
+    const weighing = this.stationWeighingByStation[code];
+    const labelPrinting = this.stationLabelPrintingByStation[code];
+    const sampling = this.stationSamplingByStation[code];
+    const repair = this.stationRepairByStation[code];
+
+    if (weighing?.isWeighingEnabled) {
+      const values = [
+        weighing.minimumWeight ? `Min ${weighing.minimumWeight}` : '',
+        weighing.maximumWeight ? `Max ${weighing.maximumWeight}` : '',
+        weighing.tolerance ? `Tolerance ${weighing.tolerance}` : '',
+      ].filter(Boolean).join(', ');
+      tasks.push(values ? `Weighing check: ${values}` : 'Weighing check enabled');
+    }
+
+    if (labelPrinting?.isLabelPrintingEnabled) {
+      const label = [labelPrinting.labelCode, labelPrinting.labelDescription].filter(Boolean).join(' - ');
+      const printer = labelPrinting.ipAddress || labelPrinting.printerName;
+      tasks.push(`Label printing: ${label || 'Enabled'}${printer ? ` on ${printer}` : ''}`);
+    }
+
+    if (sampling?.isSamplingEnabled) {
+      tasks.push(this.formatSamplingTask(sampling));
+    }
+
+    if (repair?.isRepairStationEnabled) {
+      tasks.push(`Repair routing: ${repair.repairStationName || 'Repair station selected'}`);
+    }
+
+    tasks.push(...(this.stationRulesByStation[code] || []));
+    return tasks;
+  }
+
+  private formatSamplingTask(config: StationSamplingConfig): string {
+    const type = String(config.samplingType || 'PERIODIC').replace(/_/g, ' ').toLowerCase()
+      .replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+    if (config.samplingType === 'PERIODIC') {
+      return `Sampling: ${config.sampleQty || '1'} every ${config.intervalQty || '10'} units`;
+    }
+
+    if (config.samplingType === 'LOT') {
+      return `Sampling: ${config.sampleQty || '1'} per lot of ${config.lotSize || '1000'}`;
+    }
+
+    return `Sampling: ${type}`;
   }
 
   getSiteOptionsForSelectedPlant(): Site[] {
@@ -1065,6 +1166,10 @@ export class WorkflowComponent implements OnInit, AfterViewInit, AfterViewChecke
 
   getPreviewStatusClass(status: PreviewStatus): string {
     return status.toLowerCase().replace(/\s+/g, '-');
+  }
+
+  isSampleStation(station: Pick<RoutingStepRow, 'sample_mode'> | null | undefined): boolean {
+    return String(station?.sample_mode || '').trim().toLowerCase() === 'sample';
   }
 
   savePreview(): boolean {
@@ -1532,7 +1637,7 @@ export class WorkflowComponent implements OnInit, AfterViewInit, AfterViewChecke
   private getPreviewStationIcon(index: number, step: RoutingStepRow): string {
     const normalizedName = `${step.station_name} ${step.station_code}`.toLowerCase();
 
-    if (step.sample_mode === 'Sample') {
+    if (this.isSampleStation(step)) {
       return 'saved_search';
     }
 
@@ -1872,6 +1977,10 @@ export class WorkflowComponent implements OnInit, AfterViewInit, AfterViewChecke
     }, {});
 
     this.stationRulesByStation = snapshot.stationRules || {};
+    this.stationLabelPrintingByStation = snapshot.stationLabelPrinting || {};
+    this.stationWeighingByStation = snapshot.stationWeighing || {};
+    this.stationSamplingByStation = snapshot.stationSampling || {};
+    this.stationRepairByStation = snapshot.stationRepair || {};
     this.linkedRoutingPartNumber = partNumber.pn || '';
     this.linkedRoutingDescription = partNumber.description || '';
     this.linkedBomPartNumber = partNumber.pn || '';

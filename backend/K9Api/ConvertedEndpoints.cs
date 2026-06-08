@@ -260,6 +260,13 @@ public static class ConvertedEndpoints
                     return JsonMessage("Station is already passed", 409);
                 }
 
+                var pendingRepairStep = FindPendingRepairStep(serial, routeRows, selected);
+                if (pendingRepairStep is not null)
+                {
+                    await transaction.RollbackAsync();
+                    return JsonMessage($"Repair station \"{GetStationDisplayName(pendingRepairStep)}\" is not passed. Please pass repair station before continuing.", 409);
+                }
+
                 var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
                 if (blockingStep is not null)
                 {
@@ -1576,6 +1583,25 @@ public static class ConvertedEndpoints
                     return JsonMessage("Station is already passed", 409);
                 }
 
+                var pendingRepairStep = FindPendingRepairStep(serial, routeRows, selected);
+                if (pendingRepairStep is not null)
+                {
+                    var stationName = GetStationDisplayName(pendingRepairStep);
+                    await InsertWorkflowStationLogAsync(
+                        connection,
+                        serial,
+                        selected,
+                        "NOT_PASS",
+                        $"Repair station \"{stationName}\" is not passed",
+                        loginId,
+                        serial["current_station_code"],
+                        serial["current_station_order"],
+                        serial["current_station_code"],
+                        serial["current_station_order"]);
+                    await transaction.CommitAsync();
+                    return JsonMessage($"Repair station \"{stationName}\" is not passed. Please pass repair station before continuing.", 409);
+                }
+
                 var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
                 if (blockingStep is not null)
                 {
@@ -1595,7 +1621,7 @@ public static class ConvertedEndpoints
                     return JsonMessage($"Previous station \"{stationName}\" is not passed", 409);
                 }
 
-                var failedPreviousStep = await FindLatestFailedPreviousStepAsync(connection, serial["id"]!, workflowPartId, routeRows, selectedOrder);
+                var failedPreviousStep = await FindLatestFailedPreviousStepAsync(connection, serial["id"]!, workflowPartId, routeRows, selected);
                 if (failedPreviousStep is not null)
                 {
                     var stationName = GetStationDisplayName(failedPreviousStep);
@@ -1697,10 +1723,15 @@ public static class ConvertedEndpoints
                     }, statusCode: 409);
                 }
 
-                var nextStep = routeRows.FirstOrDefault(step => Convert.ToInt32(step["station_order"]) > selectedOrder);
+                var repairReturnStep = await FindRepairReturnStepAsync(connection, serial["id"]!, workflowPartId, routeRows, selected);
+                var nextStep = repairReturnStep
+                    ?? routeRows.FirstOrDefault(step => Convert.ToInt32(step["station_order"]) > selectedOrder);
                 var nextStatus = nextStep is null ? "Completed" : "In Process";
                 var nextStationCode = nextStep?["station_code"] ?? selected["station_code"];
                 var nextStationOrder = nextStep?["station_order"] ?? selected["station_order"];
+                var passRemark = repairReturnStep is null
+                    ? "Operator station pass"
+                    : $"Repair station pass - return to {GetStationDisplayName(repairReturnStep)}";
 
                 await ExecuteAsync(
                     connection,
@@ -1724,7 +1755,7 @@ public static class ConvertedEndpoints
                     serial,
                     selected,
                     "PASS",
-                    "Operator station pass",
+                    passRemark,
                     loginId,
                     serial["current_station_code"],
                     serial["current_station_order"],
@@ -1736,7 +1767,7 @@ public static class ConvertedEndpoints
                     serial,
                     selected,
                     "PASS",
-                    "Operator station pass",
+                    passRemark,
                     loginId,
                     serial["current_station_code"],
                     serial["current_station_order"],
@@ -1753,7 +1784,9 @@ public static class ConvertedEndpoints
                 await TryPrintWorkflowStationLabelAsync(connection, serial, selected, labelPrinting);
                 return Results.Json(new
                 {
-                    message = "Station passed successfully",
+                    message = repairReturnStep is null
+                        ? "Station passed successfully"
+                        : $"Repair station passed successfully. Please pass {GetStationDisplayName(repairReturnStep)} again before continuing.",
                     station_code = selected["station_code"],
                     status = "Passed",
                     label_printing = labelPrinting
@@ -1876,6 +1909,13 @@ public static class ConvertedEndpoints
             }
 
             var selectedOrder = Convert.ToInt32(requestedStation["station_order"]);
+            var pendingRepairStep = FindPendingRepairStep(serial, routeRows, requestedStation);
+            if (pendingRepairStep is not null)
+            {
+                var stationName = GetStationDisplayName(pendingRepairStep);
+                return ExternalSnStatusResponse(false, "FAIL", $"Repair station \"{stationName}\" is not passed. Please pass repair station before continuing.", serial, requestedStation, stationHistory, null, 409);
+            }
+
             var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
             if (blockingStep is not null)
             {
@@ -5383,6 +5423,13 @@ public static class ConvertedEndpoints
             return (null, JsonMessage("Station is already passed", 409));
         }
 
+        var pendingRepairStep = FindPendingRepairStep(serial, routeRows, selected);
+        if (pendingRepairStep is not null)
+        {
+            var stationName = GetStationDisplayName(pendingRepairStep);
+            return (null, JsonMessage($"Repair station \"{stationName}\" is not passed. Please pass repair station before continuing.", 409));
+        }
+
         var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
         if (blockingStep is not null)
         {
@@ -5390,7 +5437,7 @@ public static class ConvertedEndpoints
             return (null, JsonMessage($"Previous station \"{stationName}\" is not passed", 409));
         }
 
-        var failedPreviousStep = await FindLatestFailedPreviousStepAsync(connection, serial["id"]!, workflowPartId, routeRows, selectedOrder);
+        var failedPreviousStep = await FindLatestFailedPreviousStepAsync(connection, serial["id"]!, workflowPartId, routeRows, selected);
         if (failedPreviousStep is not null)
         {
             var stationName = GetStationDisplayName(failedPreviousStep);
@@ -5918,6 +5965,13 @@ public static class ConvertedEndpoints
                 return (null, LegacyWsSimpleFail(func, "Station is already passed", 409, serial, requestedStation, history));
             }
 
+            var pendingRepairStep = FindPendingRepairStep(serial, routeRows, requestedStation);
+            if (pendingRepairStep is not null)
+            {
+                var stationName = GetStationDisplayName(pendingRepairStep);
+                return (null, LegacyWsSimpleFail(func, $"Repair station \"{stationName}\" is not passed. Please pass repair station before continuing.", 409, serial, requestedStation, history));
+            }
+
             var blockingStep = FindBlockingRequiredStep(routeRows, currentOrder, selectedOrder);
             if (blockingStep is not null)
             {
@@ -6388,6 +6442,34 @@ public static class ConvertedEndpoints
         });
     }
 
+    private static Dictionary<string, object?>? FindPendingRepairStep(
+        Dictionary<string, object?> serial,
+        List<Dictionary<string, object?>> routeRows,
+        Dictionary<string, object?> selected)
+    {
+        if (!string.Equals(serial["serial_status"]?.ToString(), "Repair", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var currentStationCode = serial["current_station_code"]?.ToString();
+        if (string.IsNullOrWhiteSpace(currentStationCode) ||
+            string.Equals(currentStationCode, selected["station_code"]?.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var currentOrder = ResolveCurrentOrder(serial, routeRows);
+        var selectedOrder = Convert.ToInt32(selected["station_order"]);
+        if (selectedOrder <= currentOrder)
+        {
+            return null;
+        }
+
+        return routeRows.FirstOrDefault(step =>
+            string.Equals(step["station_code"]?.ToString(), currentStationCode, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static bool IsOptionalSampleStep(Dictionary<string, object?> step)
     {
         return string.Equals(step["sample_mode"]?.ToString(), "Sample", StringComparison.OrdinalIgnoreCase);
@@ -6411,8 +6493,9 @@ public static class ConvertedEndpoints
         object workflowSerialId,
         int workflowPartId,
         List<Dictionary<string, object?>> routeRows,
-        int selectedOrder)
+        Dictionary<string, object?> selected)
     {
+        var selectedOrder = Convert.ToInt32(selected["station_order"]);
         var previousSteps = routeRows
             .Where(step => Convert.ToInt32(step["station_order"]) < selectedOrder)
             .Where(step => !string.IsNullOrWhiteSpace(step["station_code"]?.ToString()))
@@ -6453,7 +6536,7 @@ public static class ConvertedEndpoints
                 continue;
             }
 
-            if (await IsFailureClearedByRepairAsync(connection, workflowSerialId, workflowPartId, routeRows, step, selectedOrder, latest["created_at"]))
+            if (await IsSelectedRepairStationForFailedStepAsync(connection, workflowPartId, routeRows, step, selected))
             {
                 continue;
             }
@@ -6464,14 +6547,69 @@ public static class ConvertedEndpoints
         return null;
     }
 
-    private static async Task<bool> IsFailureClearedByRepairAsync(
+    private static async Task<Dictionary<string, object?>?> FindRepairReturnStepAsync(
         NpgsqlConnection connection,
         object workflowSerialId,
         int workflowPartId,
         List<Dictionary<string, object?>> routeRows,
+        Dictionary<string, object?> selected)
+    {
+        var selectedOrder = Convert.ToInt32(selected["station_order"]);
+        var previousSteps = routeRows
+            .Where(step => Convert.ToInt32(step["station_order"]) < selectedOrder)
+            .Where(step => !string.IsNullOrWhiteSpace(step["station_code"]?.ToString()))
+            .ToList();
+
+        if (previousSteps.Count == 0)
+        {
+            return null;
+        }
+
+        var previousCodes = previousSteps
+            .Select(step => step["station_code"]!.ToString()!)
+            .ToArray();
+
+        var rows = await QueryRowsAsync(
+            connection,
+            """
+            SELECT DISTINCT ON (UPPER(station_code)) station_code, action_result
+            FROM workflow_serial_station_logs
+            WHERE workflow_serial_id = @serialId
+              AND station_code = ANY(@stationCodes)
+              AND UPPER(action_result) IN ('PASS', 'FAIL')
+            ORDER BY UPPER(station_code), created_at DESC, id DESC
+            """,
+            ("serialId", workflowSerialId),
+            ("stationCodes", previousCodes));
+
+        var latestByStation = rows
+            .Where(row => !string.IsNullOrWhiteSpace(row["station_code"]?.ToString()))
+            .ToDictionary(row => row["station_code"]!.ToString()!, row => row, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var step in previousSteps)
+        {
+            var stationCode = step["station_code"]?.ToString() ?? string.Empty;
+            if (!latestByStation.TryGetValue(stationCode, out var latest) ||
+                !string.Equals(latest["action_result"]?.ToString(), "FAIL", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (await IsSelectedRepairStationForFailedStepAsync(connection, workflowPartId, routeRows, step, selected))
+            {
+                return step;
+            }
+        }
+
+        return null;
+    }
+
+    private static async Task<bool> IsSelectedRepairStationForFailedStepAsync(
+        NpgsqlConnection connection,
+        int workflowPartId,
+        List<Dictionary<string, object?>> routeRows,
         Dictionary<string, object?> failedStep,
-        int selectedOrder,
-        object? failedAt)
+        Dictionary<string, object?> selected)
     {
         var repairConfig = await GetWorkflowRepairStationConfigAsync(connection, workflowPartId, failedStep["station_code"]?.ToString());
         if (repairConfig is null ||
@@ -6487,35 +6625,7 @@ public static class ConvertedEndpoints
             return false;
         }
 
-        var failedOrder = Convert.ToInt32(failedStep["station_order"]);
-        var repairOrder = Convert.ToInt32(repairStep["station_order"]);
-        if (repairOrder <= failedOrder || repairOrder > selectedOrder)
-        {
-            return false;
-        }
-
-        if (repairOrder == selectedOrder)
-        {
-            return true;
-        }
-
-        var rows = await QueryRowsAsync(
-            connection,
-            """
-            SELECT id
-            FROM workflow_serial_station_logs
-            WHERE workflow_serial_id = @serialId
-              AND UPPER(station_code) = UPPER(@repairStationCode)
-              AND UPPER(action_result) = 'PASS'
-              AND created_at > @failedAt
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            ("serialId", workflowSerialId),
-            ("repairStationCode", repairStep["station_code"]),
-            ("failedAt", failedAt));
-
-        return rows.Count > 0;
+        return string.Equals(repairStep["station_code"]?.ToString(), selected["station_code"]?.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<string?> ResolveRepairRedirectMessageAsync(
@@ -8203,6 +8313,8 @@ public static class ConvertedEndpoints
 
             var labelPrintingRows = await GetWorkflowStationLabelPrintingRowsAsync(connection, workflowPartId);
             var weighingRows = await GetWorkflowStationWeighingRowsAsync(connection, workflowPartId);
+            var samplingRows = await GetWorkflowStationSamplingRowsAsync(connection, workflowPartId);
+            var repairRows = await GetWorkflowStationRepairRowsAsync(connection, workflowPartId);
 
             var statusRows = await QueryRowsAsync(
                 connection,
@@ -8230,6 +8342,8 @@ public static class ConvertedEndpoints
                 stationRules = GroupWorkflowRules(ruleRows),
                 stationLabelPrinting = GroupWorkflowStationLabelPrinting(labelPrintingRows),
                 stationWeighing = GroupWorkflowStationWeighing(weighingRows),
+                stationSampling = GroupWorkflowStationSampling(samplingRows),
+                stationRepair = GroupWorkflowStationRepair(repairRows),
                 previewStatuses = statusRows.ToDictionary(
                     row => Convert.ToString(row["station_code"]) ?? string.Empty,
                     row => Convert.ToString(row["status"]) ?? string.Empty)
@@ -8338,6 +8452,8 @@ public static class ConvertedEndpoints
             stationRules = new Dictionary<string, List<string>>(),
             stationLabelPrinting = new Dictionary<string, object>(),
             stationWeighing = new Dictionary<string, object>(),
+            stationSampling = new Dictionary<string, object>(),
+            stationRepair = new Dictionary<string, object>(),
             previewStatuses = new Dictionary<string, string>()
         };
     }
@@ -8460,6 +8576,82 @@ public static class ConvertedEndpoints
             ["tolerance"] = Convert.ToString(row["tolerance"]) ?? string.Empty,
             ["isWeighingEnabled"] = row["is_weighing_enabled"] is bool enabled && enabled
         };
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowStationSamplingRowsAsync(NpgsqlConnection connection, int workflowPartId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              s.station_code,
+              COALESCE(s.station_id, r.id) AS station_id,
+              COALESCE(NULLIF(s.station_name, ''), r.station_name, '') AS station_name,
+              COALESCE(s.sampling_type, 'PERIODIC') AS sampling_type,
+              COALESCE(s.interval_qty::text, '10') AS interval_qty,
+              COALESCE(s.sample_qty::text, '1') AS sample_qty,
+              COALESCE(s.lot_size::text, '1000') AS lot_size,
+              COALESCE(s.is_sampling_enabled, FALSE) AS is_sampling_enabled
+            FROM workflow_station_sampling s
+            LEFT JOIN workflow_routing_steps r
+              ON r.workflow_part_id = s.workflow_part_id
+             AND r.station_code = s.station_code
+            WHERE s.workflow_part_id = @workflowPartId
+            ORDER BY s.station_code ASC
+            """,
+            ("workflowPartId", workflowPartId));
+    }
+
+    private static Dictionary<string, object> GroupWorkflowStationSampling(List<Dictionary<string, object?>> rows)
+    {
+        return rows.ToDictionary(
+            row => Convert.ToString(row["station_code"]) ?? string.Empty,
+            row => (object)new Dictionary<string, object?>
+            {
+                ["stationId"] = row["station_id"] is null || row["station_id"] is DBNull ? null : Convert.ToInt32(row["station_id"]),
+                ["stationName"] = Convert.ToString(row["station_name"]) ?? string.Empty,
+                ["samplingType"] = Convert.ToString(row["sampling_type"]) ?? "PERIODIC",
+                ["intervalQty"] = Convert.ToString(row["interval_qty"]) ?? "10",
+                ["sampleQty"] = Convert.ToString(row["sample_qty"]) ?? "1",
+                ["lotSize"] = Convert.ToString(row["lot_size"]) ?? "1000",
+                ["isSamplingEnabled"] = row["is_sampling_enabled"] is bool enabled && enabled
+            },
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static async Task<List<Dictionary<string, object?>>> GetWorkflowStationRepairRowsAsync(NpgsqlConnection connection, int workflowPartId)
+    {
+        return await QueryRowsAsync(
+            connection,
+            """
+            SELECT
+              rp.station_code,
+              COALESCE(rp.station_id, r.id) AS station_id,
+              COALESCE(NULLIF(rp.station_name, ''), r.station_name, '') AS station_name,
+              COALESCE(rp.repair_station_name, '') AS repair_station_name,
+              COALESCE(rp.is_repair_station_enabled, FALSE) AS is_repair_station_enabled
+            FROM workflow_station_repair rp
+            LEFT JOIN workflow_routing_steps r
+              ON r.workflow_part_id = rp.workflow_part_id
+             AND r.station_code = rp.station_code
+            WHERE rp.workflow_part_id = @workflowPartId
+            ORDER BY rp.station_code ASC
+            """,
+            ("workflowPartId", workflowPartId));
+    }
+
+    private static Dictionary<string, object> GroupWorkflowStationRepair(List<Dictionary<string, object?>> rows)
+    {
+        return rows.ToDictionary(
+            row => Convert.ToString(row["station_code"]) ?? string.Empty,
+            row => (object)new Dictionary<string, object?>
+            {
+                ["stationId"] = row["station_id"] is null || row["station_id"] is DBNull ? null : Convert.ToInt32(row["station_id"]),
+                ["stationName"] = Convert.ToString(row["station_name"]) ?? string.Empty,
+                ["repairStationName"] = Convert.ToString(row["repair_station_name"]) ?? string.Empty,
+                ["isRepairStationEnabled"] = row["is_repair_station_enabled"] is bool enabled && enabled
+            },
+            StringComparer.OrdinalIgnoreCase);
     }
 
     private static async Task<Dictionary<string, object?>?> GetWorkflowStationWeighingConfigAsync(
