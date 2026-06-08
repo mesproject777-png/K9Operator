@@ -160,3 +160,20 @@ thead th {
 ::-webkit-scrollbar-thumb:hover {
 	background: #6f879f;
 }
+
+app-dashboard .page-content {
+	background: transparent;
+}
+
+app-dashboard .dashboard-page,
+app-dashboard .debug-dashboard-page,
+app-dashboard .debug-page,
+app-dashboard .debug-dashboard,
+app-dashboard .today-dashboard,
+app-dashboard .todays-dashboard,
+app-dashboard .activity-quality-dashboard,
+app-dashboard .quality-dashboard {
+	background: transparent !important;
+	border: 0 !important;
+	box-shadow: none !important;
+}

@@ -214,9 +214,19 @@
                         (pointerdown)="openPreviewLogisticsDetails($event, node)"
                         (click)="openPreviewLogisticsDetails($event, node)"
                       >
-                        <span class="logistics-icon material-symbols-outlined" aria-hidden="true">
-                          {{ node.icon }}
-                        </span>
+                        <ng-container [ngSwitch]="node.variant">
+                          <img
+                            *ngSwitchCase="'cart'"
+                            class="logistics-image"
+                            [src]="getLogisticsStatus(node.variant) === 'Passed' ? 'assets/sn-chart/carton-closed.svg' : 'assets/sn-chart/carton-open.svg'"
+                            alt=""
+                            aria-hidden="true"
+                          >
+                          <img *ngSwitchCase="'pallet'" class="logistics-image" src="assets/sn-chart/pallet.svg" alt="" aria-hidden="true">
+                          <span *ngSwitchDefault class="logistics-icon material-symbols-outlined" aria-hidden="true">
+                            {{ node.icon }}
+                          </span>
+                        </ng-container>
                         <strong>{{ node.title }}</strong>
                         <small *ngIf="node.subtitle">{{ node.subtitle }}</small>
                         <small
@@ -480,7 +490,18 @@
   <div class="preview-station-modal" role="dialog" aria-modal="true" aria-labelledby="previewLogisticsTitle">
     <div class="station-modal-top">
       <span class="station-modal-icon-wrap" aria-hidden="true">
-        <span class="station-modal-icon material-symbols-outlined">{{ activeLogisticsIcon }}</span>
+        <img
+          *ngIf="logistics.variant === 'cart'; else nonCartonLogisticsIcon"
+          class="modal-logistics-image"
+          [src]="activeLogisticsStatus === 'Passed' ? 'assets/sn-chart/carton-closed.svg' : 'assets/sn-chart/carton-open.svg'"
+          alt=""
+        >
+        <ng-template #nonCartonLogisticsIcon>
+          <img *ngIf="logistics.variant === 'pallet'; else materialLogisticsIcon" class="modal-logistics-image" src="assets/sn-chart/pallet.svg" alt="">
+        </ng-template>
+        <ng-template #materialLogisticsIcon>
+          <span class="station-modal-icon material-symbols-outlined">{{ activeLogisticsIcon }}</span>
+        </ng-template>
         <span class="station-modal-gear material-symbols-outlined">inventory_management</span>
       </span>
       <div>
